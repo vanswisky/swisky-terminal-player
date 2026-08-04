@@ -9,22 +9,7 @@ ever leaving your terminal.
 ![python](https://img.shields.io/badge/python-3.12%2B-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
-```
-┌────────────────────────────────────────────────────────────────────────────┐
-│                        SWISKY TERMINAL PLAYER                              │
-├──────────────────────────────┬─────────────────────────────────────────────┤
-│                               │ NOW PLAYING                                 │
-│                               │ Song Title — Artist                         │
-│      ASCII ALBUM ART          │ Album · Genre · Codec · Bitrate             │
-│      (Braille / Block /       │ ━━━━━━━━━●───────────  01:37 / 04:17        │
-│       Classic, TrueColor)     │                                             │
-│                               │ ▶ And another one gone, and another one gone│
-├──────────────────────────────┴─────────────────────────────────────────────┤
-│                      REALTIME AUDIO SPECTRUM                               │
-├────────────────────────────────────────────────────────────────────────────┤
-│ 🔊 80% │   ⏮   │   ▶   │   ⏭   │ REPEAT │ SHUFFLE │ QUEUE ☰ │ ⚙ │ EXIT ✕ │
-└────────────────────────────────────────────────────────────────────────────┘
-```
+![preview](preview.png)
 
 ## Highlights
 
