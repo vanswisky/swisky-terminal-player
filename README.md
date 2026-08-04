@@ -41,7 +41,7 @@ ever leaving your terminal.
 ## Install
 
 ```bash
-git clone https://github.com/yourname/swisky-terminal-player
+git clone https://github.com/vanswisky/swisky-terminal-player
 cd swisky-terminal-player
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
