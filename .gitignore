@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+config.json
+swisky.log
+assets/cache/*
+!assets/cache/.gitkeep
+assets/covers/*
+!assets/covers/.gitkeep
+assets/playlists/*
+!assets/playlists/.gitkeep
