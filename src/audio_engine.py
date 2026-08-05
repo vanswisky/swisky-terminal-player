@@ -27,9 +27,18 @@ logger = logging.getLogger(__name__)
 
 # mpv's "end-file" event fires for several reasons, not just a track
 # finishing naturally — it also fires when we call stop() ourselves or
-# replace the current file with a new load(). Only "eof" means "this
-# track played through to the end and playback should advance".
-_EOF_REASON_NATURAL_END = "eof"
+# replace the current file with a new load(). Only a "natural EOF"
+# reason means "this track played through to the end and playback
+# should advance". In real python-mpv, `event_callback("end-file")`
+# hands back the raw ctypes `MpvEvent` struct (NOT a dict!) — the
+# reason lives at `event.data.reason` as a plain C int matching
+# libmpv's `mpv_end_file_reason` enum, where EOF == 0. An earlier
+# version of this file assumed a dict shape (`event["event"]["reason"]`
+# holding the string "eof"), which never matched the real struct at
+# all — `isinstance(event, dict)` was always False, so this flag never
+# got set and auto-advance silently never fired. See
+# `_extract_end_file_reason` below for the actual, verified shape.
+_EOF_REASON_NATURAL_END = 0
 
 
 @dataclass(slots=True)
@@ -91,7 +100,7 @@ class AudioEngine:
         @self._mpv.event_callback("end-file")
         def _on_end_file(event):  # noqa: ANN001
             reason = self._extract_end_file_reason(event)
-            if reason != _EOF_REASON_NATURAL_END:
+            if not self._is_natural_eof(reason):
                 # Caused by our own stop()/load() calls, or a real
                 # error — never something we should auto-advance for.
                 return
@@ -99,20 +108,56 @@ class AudioEngine:
                 self._eof_pending = True
 
     @staticmethod
-    def _extract_end_file_reason(event) -> Optional[str]:  # noqa: ANN001
-        """python-mpv has represented this a couple of different ways
-        across versions — be liberal about what we accept rather than
-        silently never matching (which is what let *every* end-file,
-        regardless of cause, fall through to "treat as natural EOF").
+    def _extract_end_file_reason(event):  # noqa: ANN001
+        """Real `python-mpv` hands `event_callback` the raw ctypes
+        `MpvEvent` struct, not a dict. `event.data` casts it to the
+        event-specific payload — `MpvEventEndFile` for this event type
+        — whose `.reason` field is a plain C int (0 == natural EOF,
+        matching libmpv's `mpv_end_file_reason` / python-mpv's
+        `MpvEventEndFile.EOF`). Verified directly against python-mpv's
+        source (mpv.py: `MpvEventEndFile`, `event_callback`).
+
+        Also accepts a dict shape as a fallback, in case some wrapper
+        or test double serializes events differently — better to
+        handle both than to silently match neither, which is exactly
+        the bug this replaced (the previous version required a dict
+        and never got one, so this flag never fired).
         """
-        if not isinstance(event, dict):
-            return None
-        if "reason" in event:
-            return event["reason"]
-        inner = event.get("event")
-        if isinstance(inner, dict):
-            return inner.get("reason")
+        data = getattr(event, "data", None)
+        if data is not None and hasattr(data, "reason"):
+            return data.reason
+        if isinstance(event, dict):
+            if "reason" in event:
+                return event["reason"]
+            inner = event.get("event")
+            if isinstance(inner, dict):
+                return inner.get("reason")
         return None
+
+    @staticmethod
+    def _is_natural_eof(reason) -> bool:
+        """Normalizes whatever shape `reason` came in as (raw int 0,
+        the string "eof", or an enum member) to a single yes/no answer,
+        so this doesn't silently break again if python-mpv changes how
+        it represents this between versions.
+        """
+        if reason is None:
+            return False
+        if isinstance(reason, bool):
+            return False
+        if isinstance(reason, int):
+            return reason == _EOF_REASON_NATURAL_END
+        if isinstance(reason, str):
+            return reason.lower() == "eof"
+        name = getattr(reason, "name", None)
+        if isinstance(name, str) and name.lower() == "eof":
+            return True
+        value = getattr(reason, "value", None)
+        if isinstance(value, str) and value.lower() == "eof":
+            return True
+        if isinstance(value, int) and value == _EOF_REASON_NATURAL_END:
+            return True
+        return False
 
     # -- transport ---------------------------------------------------
 
