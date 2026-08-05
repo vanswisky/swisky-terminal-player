@@ -105,12 +105,28 @@ RED = Theme(
     danger="#ff5c7a",
 )
 
+NEUTRAL = Theme(
+    name="Charcoal/Zinc",
+    accent="#FAFAFA",
+    accent_dim="#A1A1AA",
+    background="#09090B",
+    surface="#18181B",
+    border="#27272A",
+    text_primary="#F4F4F5",
+    text_secondary="#D4D4D8",
+    text_muted="#71717A",
+    success="#5cffb0",
+    warning="#ffd75c",
+    danger="#ff5c7a",
+)
+
 THEMES: dict[str, Theme] = {
     "purple": PURPLE,
     "blue": BLUE,
     "green": GREEN,
     "amber": AMBER,
     "red": RED,
+    "Charcoal/Zinc": NEUTRAL
 }
 
 DEFAULT_THEME_NAME = "purple"
