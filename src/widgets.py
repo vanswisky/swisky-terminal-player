@@ -31,18 +31,22 @@ from visualizer import SpectrumFrame
 # ASCII album art
 # --------------------------------------------------------------------------
 
-def render_ascii_art(frame: AsciiFrame | None, theme: Theme, height: int | None = None) -> Panel:
-    """`height`, when given, is the *outer* panel height (border rows
-    included) to force — a `rich.panel.Panel` sizes itself to its own
-    content by default and does NOT stretch to fill whatever `Layout`
-    region it's placed in, so without this the panel's border would
-    only wrap tightly around the ASCII art and leave the rest of a
-    taller region (e.g. after the spectrum is turned off and the body
-    row grows) unpainted/blank underneath it.
+def render_ascii_art(
+    frame: AsciiFrame | None, theme: Theme, width: int | None = None, height: int | None = None
+) -> Panel:
+    """`width`/`height`, when given, are the *outer* panel dimensions
+    (border included) to force — a `rich.panel.Panel` sizes itself to
+    its own content by default and does NOT stretch to fill whatever
+    `Layout` region it's placed in, so without this the panel would
+    only wrap tightly around the ASCII art. `ui.py::_art_geometry`
+    derives both from the cover's own aspect ratio (not from however
+    much room the surrounding layout happens to have that frame), so
+    the box stays a consistent shape and `ui.py` centers it — with
+    `Align` — in whatever space is left rather than stretching it.
 
     Centering (rather than stretching) the art inside that forced
-    height is what keeps the cover itself square/undistorted — only
-    the surrounding border grows, never the image.
+    size is what keeps the cover itself undistorted — only the
+    surrounding border would grow/shrink, never the image.
     """
     if frame is None:
         inner = Text("No cover art", style=theme.text_muted)
@@ -62,6 +66,7 @@ def render_ascii_art(frame: AsciiFrame | None, theme: Theme, height: int | None 
         body,
         border_style=theme.border,
         padding=(0, 1),
+        width=width,
         height=height,
     )
 

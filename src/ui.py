@@ -40,6 +40,7 @@ import logging
 import threading
 import time
 
+from rich.align import Align
 from rich.console import Console, Group
 from rich.layout import Layout
 from rich.live import Live
@@ -82,6 +83,14 @@ CONTROL_BAR_SEGMENTS = (
 # border, not the padding, and started counting one column too early).
 _PANEL_H_CHROME = 4
 _PANEL_CONTENT_LEFT = 3  # 1-indexed column of the first interior character
+
+# Same horizontal chrome (border + padding, each side) applies to the
+# album-art panel — it uses the identical `padding=(0, 1)` — so this is
+# `_PANEL_H_CHROME` under a name that reads right in `_art_geometry`.
+# Vertical chrome is just the 2 border rows: `render_ascii_art`'s
+# padding is horizontal-only, so there's no vertical padding to add.
+_ART_CHROME_W = _PANEL_H_CHROME
+_ART_CHROME_H = 2
 
 
 class ScreenMode(enum.Enum):
@@ -138,6 +147,12 @@ class App:
         # element matters.
         self._last_art_size: tuple[int, int, bool] | None = None
         self._ascii_frame = None
+        # (panel_width, panel_height) the art Panel was last built at —
+        # computed alongside `_ascii_frame` in `_build_layout` (see
+        # `_art_geometry`) so the border always matches exactly what
+        # the renderer produced, instead of being force-stretched to
+        # fill whatever room happened to be available that frame.
+        self._art_panel_size: tuple[int, int] | None = None
 
         # -- Online (iTunes search, YouTube audio) screen state ------
         # A single incrementing generation counter gates every
@@ -700,11 +715,10 @@ class App:
         theme = self.theme_mgr.current
         state = self.player.snapshot()
         track = self.player.current_track()
-        body_h = self._body_height()
 
         # The visualizer's on/off state is part of the cache key here,
         # not just console size: toggling it changes the art panel's
-        # available height (see `_visualizer_height`/`_art_columns`),
+        # available height (see `_visualizer_height`/`_art_geometry`),
         # so the ASCII frame has to be re-rendered at the new column/row
         # count too — otherwise the old frame (fitted for the old,
         # shorter or taller panel) gets stretched into the new panel
@@ -712,14 +726,34 @@ class App:
         # look "lonjong" (oval) whenever the spectrum was toggled.
         current_size = (self.console.size.width, self.console.size.height, self.config.visualizer.enabled)
         size_changed = current_size != self._last_art_size
-        if track and track.cover_path and (track.cover_path != self._last_cover or size_changed):
-            self._ascii_frame = self.ascii_cache.get(
-                track.cover_path, columns=self._art_columns(track.cover_path)
-            )
-            self._last_cover = track.cover_path
-            self._last_art_size = current_size
-        elif track is None:
+
+        if track and track.cover_path:
+            if track.cover_path != self._last_cover or size_changed:
+                cols, panel_w, panel_h = self._art_geometry(track.cover_path)
+                self._ascii_frame = self.ascii_cache.get(track.cover_path, columns=cols)
+                self._art_panel_size = (panel_w, panel_h)
+                self._last_cover = track.cover_path
+                self._last_art_size = current_size
+        else:
+            # No track, or a track whose cover art couldn't be found/
+            # extracted — clear whatever was showing instead of leaving
+            # the previous track's cover on screen. The old check here
+            # only ever handled `track is None`; a track that simply
+            # has no `cover_path` fell through both branches and kept
+            # showing whatever the last track with art had rendered.
+            #
+            # Geometry is recomputed unconditionally here (not gated by
+            # `size_changed`, unlike the real-cover branch above) — it's
+            # cheap with no cover file to open, and skipping it on a
+            # plain track-change (no resize) would leave the placeholder
+            # box sized for whatever the *previous* track's cover aspect
+            # ratio happened to be, for one frame's worth of visible
+            # wrong-shaped box.
             self._ascii_frame = None
+            self._last_cover = None
+            _, panel_w, panel_h = self._art_geometry(None)
+            self._art_panel_size = (panel_w, panel_h)
+            self._last_art_size = current_size
 
         # NOTE: rich.layout's fixed-size resolver treats `size=0` as
         # falsy and silently falls back to ratio-based sizing for that
@@ -748,7 +782,14 @@ class App:
         )
 
         layout["header"].update(self._render_header(theme))
-        layout["art"].update(widgets.render_ascii_art(self._ascii_frame, theme, height=body_h))
+        panel_w, panel_h = self._art_panel_size or (max(10, _ART_CHROME_W), max(5, _ART_CHROME_H))
+        layout["art"].update(
+            Align(
+                widgets.render_ascii_art(self._ascii_frame, theme, width=panel_w, height=panel_h),
+                align="center",
+                vertical="middle",
+            )
+        )
 
         now_playing = widgets.render_now_playing(track, theme)
         progress_bar = widgets.render_progress_bar(state.position, state.duration, theme)
@@ -919,41 +960,62 @@ class App:
 
         return None
 
-    def _art_columns(self, cover_path: str) -> int:
-        from config import ASCII_QUALITY_COLUMNS
+    def _art_geometry(self, cover_path: str | None) -> tuple[int, int, int]:
+        """(columns, panel_width, panel_height) for the album-art panel.
+
+        Width is derived only from console width — this column always
+        gets 1/3 of it, border+padding included — never from `body_h`.
+        `body_h` (rows left for the body row) swings a lot depending on
+        whether the visualizer row exists this frame (10 rows vs. none
+        at all — see the `size=0` Rich gotcha noted in `_build_layout`),
+        and forcing the panel's own height to always equal `body_h`
+        used to stretch the box into a tall, "lonjong" (elongated)
+        rectangle whenever the visualizer was off and squash it back
+        "gepeng" (flattened) whenever it was on — the box's *shape*
+        changed on every toggle even though the artwork itself never
+        did.
+
+        Height instead comes from the cover's own aspect ratio and the
+        terminal's ~2:1 character-cell aspect (the exact same formula
+        `ascii_renderer._target_rows` uses), clamped only to whatever
+        vertical room is actually available. That keeps the box a
+        consistent shape regardless of how much spare `body_h` there
+        is; any leftover room is blank space *around* the box
+        (`_build_layout` centers it there with `Align`), never a
+        stretch of the box itself.
+
+        Column count and the final row count are derived in a single
+        pass from the *same* `cols` — rather than picking an
+        approximate panel height first and fitting columns to it after
+        — so the border can never end up a row short (clipping the
+        last line of art) or a row long (a blank gap at the bottom)
+        relative to what the renderer actually produces.
+        """
         from ascii_renderer import CHAR_ASPECT_COMPENSATION
+        from config import ASCII_QUALITY_COLUMNS
         from PIL import Image
 
+        console_w = self.console.size.width
+        art_panel_w = max(10, console_w // 3)
+        body_h = self._body_height()
+
+        max_cols = max(10, art_panel_w - _ART_CHROME_W)
+        max_rows = max(5, body_h - _ART_CHROME_H)
+
+        aspect = 1.0
+        if cover_path:
+            try:
+                with Image.open(cover_path) as img:
+                    aspect = img.height / img.width if img.width else 1.0
+            except (OSError, ZeroDivisionError, ValueError):
+                aspect = 1.0
+
         base = ASCII_QUALITY_COLUMNS[self.config.ascii.quality]
-
-        # The "art" region gets 1 part out of 3 (art:info = 1:2 in
-        # `layout["body"].split_row`) — NOT half the console width.
-        # Using half-width here (the old bug) let the renderer produce
-        # art wider than its actual panel, which either got clipped or
-        # wrapped by the terminal. Height was never constrained at all,
-        # so tall covers could also overflow the panel's bottom edge.
-        console_w, console_h = self.console.size.width, self.console.size.height
-        art_panel_w = max(1, console_w // 3)
-        art_panel_h = max(1, console_h - (self.HEADER_H + self._visualizer_height() + self.CONTROLS_H))
-
-        # Panel chrome: border (1 each side) + padding=(0, 1) (1 each
-        # side horizontally, 0 vertically) from render_ascii_art.
-        max_cols = max(10, art_panel_w - 4)
-        max_rows = max(5, art_panel_h - 2)
-
-        try:
-            with Image.open(cover_path) as img:
-                aspect = img.height / img.width if img.width else 1.0
-        except (OSError, ZeroDivisionError, ValueError):
-            aspect = 1.0
-
-        # Letterbox-fit: given the renderer derives rows from
-        # `cols * aspect / CHAR_ASPECT_COMPENSATION` (see
-        # ascii_renderer._target_rows), solve the inverse for the column
-        # count that would exactly fill the available rows, then take
-        # whichever of the width- or height-based limit is smaller —
-        # same idea as fitting a photo into a frame without cropping.
+        # Letterbox-fit: the largest column count — capped by the art
+        # column's width, the quality setting, and however many rows
+        # are actually available — whose derived row count still fits.
         cols_for_height = max_rows * CHAR_ASPECT_COMPENSATION / max(aspect, 1e-6)
-        fitted = min(max_cols, cols_for_height)
+        cols = max(10, min(base, max_cols, int(cols_for_height)))
+        rows = max(1, int(cols * aspect / CHAR_ASPECT_COMPENSATION))
 
-        return max(10, min(base, int(fitted)))
+        return cols, cols + _ART_CHROME_W, rows + _ART_CHROME_H
