@@ -74,16 +74,34 @@ class Player:
             if self.queue.jump_to(index) is not None:
                 self._play_current()
 
+    def play_online_next(self, track: TrackMetadata) -> None:
+        """Insert an online-resolved track right after whatever's
+        currently playing and jump to it immediately — used by the
+        Online Search screen's Enter key. Doesn't disturb the rest of
+        the queue.
+        """
+        with self._lock:
+            self.queue.add_next(track)
+            self.play_index(self.queue.cursor + 1)
+
+    def _load_track(self, track: TrackMetadata) -> None:
+        """Shared by `_play_current`/`next`/`previous` so online tracks'
+        `stream_headers` (needed by some CDNs to avoid a 403) get
+        forwarded to mpv the same way regardless of which of those
+        three called us.
+        """
+        self.engine.load(track.path, http_headers=track.stream_headers)
+        self.engine.set_speed(self.config.speed)
+        self.lyrics.load_for_track(track)
+        self._notify_track_changed()
+
     def _play_current(self) -> None:
         track = self.queue.current()
         if track is None:
             self.engine.stop()
             self._notify_track_changed()
             return
-        self.engine.load(track.path)
-        self.engine.set_speed(self.config.speed)
-        self.lyrics.load_for_track(track)
-        self._notify_track_changed()
+        self._load_track(track)
 
     # -- transport ------------------------------------------------------
 
@@ -106,10 +124,7 @@ class Player:
                 self.engine.stop()
                 self._notify_track_changed()
                 return
-            self.engine.load(track.path)
-            self.engine.set_speed(self.config.speed)
-            self.lyrics.load_for_track(track)
-            self._notify_track_changed()
+            self._load_track(track)
 
     def previous(self) -> None:
         with self._lock:
@@ -121,10 +136,7 @@ class Player:
             track = self.queue.previous(self.config.shuffle)
             if track is None:
                 return
-            self.engine.load(track.path)
-            self.engine.set_speed(self.config.speed)
-            self.lyrics.load_for_track(track)
-            self._notify_track_changed()
+            self._load_track(track)
 
     def poll(self) -> None:
         """Call once per frame from the main thread. Detects a track

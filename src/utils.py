@@ -34,6 +34,11 @@ def file_hash(path: str, block_size: int = 65536) -> str:
     Uses size + mtime as a cheap fingerprint rather than hashing full
     file contents (music files and cover art can be large), falling
     back to a full hash only if stat() fails.
+
+    Only for real filesystem paths — for anything else (URLs, search
+    queries), use `text_hash` instead; calling this on a URL raises,
+    since neither `os.stat` nor the plain `open()` fallback can reach
+    the network.
     """
     try:
         stat = os.stat(path)
@@ -45,6 +50,14 @@ def file_hash(path: str, block_size: int = 65536) -> str:
             for chunk in iter(lambda: f.read(block_size), b""):
                 h.update(chunk)
         return h.hexdigest()[:16]
+
+
+def text_hash(text: str) -> str:
+    """Cache-key hash for arbitrary text (a URL, a video ID, a search
+    query) rather than a filesystem path. Safe to call on anything —
+    unlike `file_hash`, never touches the filesystem or network.
+    """
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
 
 
 def terminal_size(default_cols: int = 100, default_rows: int = 32) -> tuple[int, int]:

@@ -8,33 +8,46 @@ asks `ascii_cache.py` for the current cover's ASCII frame, asks
 draw all of it into a `Layout` matching the spec:
 
     ┌───────────────────────────────────────────┐
-    │            CINEMATIC HEADER                │
+    │                 SEARCH BAR                  │
     ├───────────────────┬─────────────────────────┤
     │                   │  NOW PLAYING / LYRICS    │
     │   ASCII ALBUM ART │  (enlarged, no dummy     │
     │                   │   "features" panel)      │
     ├───────────────────┴─────────────────────────┤
-    │        REALTIME AUDIO SPECTRUM (full width)  │
+    │   REALTIME AUDIO SPECTRUM (full width) — only │
+    │   present when the visualizer is turned ON    │
     ├───────────────────────────────────────────────┤
     │  VOL│PREV│PLAY│NEXT│REPEAT│SHUFFLE│QUEUE│...      │
     └───────────────────────────────────────────────┘
 
+The spectrum row (see `_visualizer_height`) collapses to 0 rows
+whenever `config.visualizer.enabled` is off (toggle with the `v` key
+or from Settings), handing that space back to the album art / now
+playing area so the UI feels bigger with it off rather than leaving
+an empty panel behind. Cover art is re-rendered at the new panel size
+whenever that happens (see the `current_size` cache key in
+`_build_layout`) so the ASCII art's own aspect ratio stays correct
+instead of looking stretched/squashed.
+
 Screen modes (mutually exclusive overlays): NORMAL, QUEUE, SETTINGS,
-COMMAND_PALETTE. Only one owns keyboard focus at a time.
+COMMAND_PALETTE, SEARCH. Only one owns keyboard focus at a time.
 """
 
 from __future__ import annotations
 
 import enum
 import logging
+import threading
 import time
 
 from rich.console import Console, Group
 from rich.layout import Layout
 from rich.live import Live
+from rich.padding import Padding
 from rich.panel import Panel
 from rich.text import Text
 
+import online_source
 import widgets
 from ascii_cache import AsciiCache
 from command_palette import CommandPalette
@@ -42,9 +55,8 @@ from config import AppConfig, AsciiRenderMode, RepeatMode
 from keyboard_handler import KeyboardHandler
 from lyrics_manager import LyricsManager
 from mouse_handler import MouseAction, disable_mouse_reporting, enable_mouse_reporting, parse_mouse_sequence
-from playlist_manager import PlaylistManager, SortKey
+from playlist_manager import PlaylistManager
 from player import Player
-from queue_manager import QueueManager
 from scanner import LibraryScanner
 from settings_items import SETTINGS_ITEMS
 from settings_manager import SettingsManager
@@ -77,6 +89,7 @@ class ScreenMode(enum.Enum):
     QUEUE = enum.auto()
     SETTINGS = enum.auto()
     COMMAND_PALETTE = enum.auto()
+    SEARCH = enum.auto()
 
 
 class App:
@@ -120,8 +133,28 @@ class App:
         self.queue_visible_rows = 12
         self.settings_cursor = 0
         self._last_cover: str | None = None
-        self._last_art_size: tuple[int, int] | None = None
+        # (width, height, visualizer_enabled) snapshot — see the note
+        # near `_last_art_size`'s assignment below for why the third
+        # element matters.
+        self._last_art_size: tuple[int, int, bool] | None = None
         self._ascii_frame = None
+
+        # -- Online (iTunes search, YouTube audio) screen state ------
+        # A single incrementing generation counter gates every
+        # background search/resolve worker below: bumping it makes any
+        # in-flight worker's result get silently dropped once it lands
+        # (see `_poll_online_search`). Same pattern as the generation
+        # gate in lyrics_manager.py, for the same reason — a slow
+        # network response for a query/track the user has since moved
+        # past must not clobber whatever's on screen or playing now.
+        self.search_input = ""
+        self.search_results: list = []
+        self.search_cursor = 0
+        self.search_status = ""
+        self._search_lock = threading.Lock()
+        self._search_generation = 0
+        self._pending_search_result = None
+        self._pending_resolve = None
 
         # Hit regions for mouse support, recomputed each frame.
         self._progress_row: int | None = None
@@ -172,6 +205,8 @@ class App:
                     lambda m: self._rescan_library())
         cp.register(r"^playlist$", "playlist — open playlist browser", lambda m: self._set_mode(ScreenMode.QUEUE))
         cp.register(r"^queue$", "queue — open queue view", lambda m: self._set_mode(ScreenMode.QUEUE))
+        cp.register(r"^online (.+)$", "online QUERY — search for a track and open results",
+                    lambda m: self._open_search(prefill=m.group(1)))
         cp.register(r"^exit$", "exit — quit the app", lambda m: self._quit())
 
     # -- lifecycle ---------------------------------------------------------
@@ -227,6 +262,117 @@ class App:
             self.queue_scroll = self.queue_cursor - rows + 1
         self.queue_scroll = max(0, self.queue_scroll)
 
+    # -- online (iTunes search, YouTube audio) search --------------------
+    #
+    # Two network-bound steps (see online_source.py's module docstring
+    # for why they're split): a cheap `search()` against iTunes to list
+    # candidates, then a `resolve()` — only for whichever one the user
+    # actually picks — that finds a matching YouTube stream to actually
+    # play. Both run on
+    # background threads; `_poll_online_search`, called once per frame
+    # from `run()` (same pattern as `player.poll()`), is the only place
+    # that touches `self.search_*` state from the results, so nothing
+    # here ever has to worry about a render happening mid-mutation.
+
+    def _open_search(self, prefill: str = "") -> None:
+        self.mode = ScreenMode.SEARCH
+        self.search_input = prefill
+        self.search_results = []
+        self.search_cursor = 0
+        self.search_status = "" if self.config.online.enabled else "Online search is off — enable it in Settings."
+        if prefill.strip() and self.config.online.enabled:
+            self._start_online_search(prefill.strip())
+
+    def _start_online_search(self, query: str) -> None:
+        if not self.config.online.enabled:
+            self.search_status = "Online search is off — enable it in Settings."
+            return
+        self.search_status = f"Searching '{query}'…"
+        self.search_results = []
+        self.search_cursor = 0
+        generation = self._bump_search_generation()
+        threading.Thread(
+            target=self._search_worker, args=(query, generation), daemon=True
+        ).start()
+
+    def _search_worker(self, query: str, generation: int) -> None:
+        try:
+            results = online_source.search(query, limit=self.config.online.search_results)
+            payload = ("ok", results)
+        except online_source.OnlineSourceError as exc:
+            payload = ("error", str(exc))
+        with self._search_lock:
+            if generation == self._search_generation:
+                self._pending_search_result = payload
+
+    def _resolve_and_play_online(self, result) -> None:
+        self._resolve_online(result, mode="play")
+
+    def _resolve_and_enqueue_online(self, result) -> None:
+        self._resolve_online(result, mode="enqueue")
+
+    def _resolve_online(self, result, mode: str) -> None:
+        self.search_status = f"Loading '{result.title}'…"
+        generation = self._bump_search_generation()
+        threading.Thread(
+            target=self._resolve_worker, args=(result, mode, generation), daemon=True
+        ).start()
+
+    def _resolve_worker(self, result, mode: str, generation: int) -> None:
+        try:
+            track = online_source.resolve(result)
+            payload = ("ok", mode, track)
+        except online_source.OnlineSourceError as exc:
+            payload = ("error", mode, str(exc))
+        with self._search_lock:
+            if generation == self._search_generation:
+                self._pending_resolve = payload
+
+    def _bump_search_generation(self) -> int:
+        with self._search_lock:
+            self._search_generation += 1
+            self._pending_search_result = None
+            self._pending_resolve = None
+            return self._search_generation
+
+    def _cancel_search(self) -> None:
+        self._bump_search_generation()
+        self.search_status = ""
+
+    def _poll_online_search(self) -> None:
+        """Drains whatever a background search/resolve worker left
+        behind onto the main thread. Called once per frame from
+        `run()`, same pattern as `player.poll()` for track-end — never
+        touch `self.search_*` state directly from a worker thread.
+        """
+        with self._search_lock:
+            pending_search = self._pending_search_result
+            self._pending_search_result = None
+            pending_resolve = self._pending_resolve
+            self._pending_resolve = None
+
+        if pending_search is not None:
+            kind, payload = pending_search
+            if kind == "ok":
+                self.search_results = payload
+                self.search_cursor = 0
+                self.search_status = ""
+            else:
+                self.search_status = payload
+
+        if pending_resolve is not None:
+            kind, mode, payload = pending_resolve
+            if kind == "ok":
+                track = payload
+                if mode == "play":
+                    self.player.play_online_next(track)
+                    self.mode = ScreenMode.NORMAL  # jump to now-playing
+                else:
+                    self.player.queue.add_next(track)
+                self.search_status = f"Added '{track.title}' to queue." if mode == "enqueue" else ""
+            else:
+                self.search_status = payload
+
     def _quit(self) -> None:
         self.running = False
 
@@ -243,6 +389,7 @@ class App:
                 while self.running:
                     start = time.monotonic()
                     self.player.poll()  # advance queue on natural track end
+                    self._poll_online_search()  # drain background search/resolve results
                     self._handle_input()
                     layout = self._build_layout()
                     live.update(layout, refresh=True)
@@ -268,6 +415,8 @@ class App:
                 self._handle_queue_key(key)
             elif self.mode == ScreenMode.SETTINGS:
                 self._handle_settings_key(key)
+            elif self.mode == ScreenMode.SEARCH:
+                self._handle_search_key(key)
             else:
                 self._handle_normal_key(key)
 
@@ -305,6 +454,8 @@ class App:
             self._reload_cover(force=True)
         elif key == "v":
             cfg.visualizer.enabled = not cfg.visualizer.enabled
+        elif key == "o":
+            self._open_search()
         elif key == "f":
             pass  # fullscreen is inherent to `Live(screen=True)`
         elif key == "CTRL_P":
@@ -323,6 +474,16 @@ class App:
             self.mode = ScreenMode.NORMAL
         elif key == "BACKSPACE":
             self.palette_input = self.palette_input[:-1]
+        elif key == "SPACE":
+            # keyboard_handler.py reports the space bar as the logical
+            # token "SPACE" (5 chars), not a literal " " (1 char) —
+            # needed so NORMAL mode can bind it to play/pause without
+            # colliding with printable-character input. But that means
+            # the `len(key) == 1` branch below never matches a space
+            # bar press, so multi-word input (e.g. "online rex orange
+            # county") silently dropped every space and produced
+            # "onlinerexorangecounty". This branch is what was missing.
+            self.palette_input += " "
         elif len(key) == 1:
             self.palette_input += key
 
@@ -347,6 +508,59 @@ class App:
             self.queue_cursor = min(self.queue_cursor, max(0, len(self.player.queue.items) - 1))
             self._sync_queue_scroll()
 
+    def _handle_search_key(self, key: str) -> None:
+        """Text input and results browsing share one screen and one key
+        handler. While there are no results yet, typed characters build
+        `search_input` (Enter searches). Once results are showing,
+        UP/DOWN move the selection, Enter plays it, "a" adds it to the
+        queue without switching playback, and typing again clears the
+        list and starts a fresh query — the same "keep typing to search
+        again" feel as a fuzzy-finder.
+        """
+        if key == "ESC":
+            self._cancel_search()
+            self.mode = ScreenMode.NORMAL
+        elif key == "UP" and self.search_results:
+            self.search_cursor = max(0, self.search_cursor - 1)
+        elif key == "DOWN" and self.search_results:
+            self.search_cursor = min(len(self.search_results) - 1, self.search_cursor + 1)
+        elif key == "ENTER":
+            if self.search_results:
+                self._resolve_and_play_online(self.search_results[self.search_cursor])
+            elif self.search_input.strip():
+                self._start_online_search(self.search_input.strip())
+        elif key == "a" and self.search_results:
+            self._resolve_and_enqueue_online(self.search_results[self.search_cursor])
+        elif key == "BACKSPACE":
+            if self.search_results:
+                self.search_results = []
+                self.search_cursor = 0
+                self.search_status = ""
+            else:
+                self.search_input = self.search_input[:-1]
+        elif key == "SPACE":
+            # See _handle_palette_key for why "SPACE" (not a literal
+            # " ") is what arrives here — without this branch, every
+            # space in a query got silently dropped, so "rex orange
+            # county" typed as "rexorangecounty" and search results
+            # for actual song titles/artists (almost always more than
+            # one word) never matched anything.
+            if self.search_results:
+                self.search_results = []
+                self.search_cursor = 0
+                self.search_status = ""
+                self.search_input = " "
+            else:
+                self.search_input += " "
+        elif len(key) == 1:
+            if self.search_results:
+                self.search_results = []
+                self.search_cursor = 0
+                self.search_status = ""
+                self.search_input = key
+            else:
+                self.search_input += key
+
     def _handle_settings_key(self, key: str) -> None:
         if key == "ESC":
             self.mode = ScreenMode.NORMAL
@@ -366,6 +580,12 @@ class App:
         if item.invalidates_cover:
             self.ascii_cache.update_config(self.config.ascii)
             self._last_cover = None
+        if item.key == "lyrics_auto_fetch":
+            # LyricsManager reads its own `auto_fetch` attribute rather
+            # than the config live, so this has to be pushed explicitly
+            # — otherwise the toggle would only take effect after a
+            # restart, same trap `playback_speed` avoids below.
+            self.lyrics.auto_fetch = self.config.lyrics.auto_fetch
         # Playback-affecting settings should take effect immediately,
         # not just once the Settings screen is closed.
         self.player.set_speed(self.config.playback.speed)
@@ -394,8 +614,12 @@ class App:
                 self.player.seek_to_fraction(fraction)
                 return
 
-        # Control bar buttons.
-        if self.mode == ScreenMode.NORMAL and self._control_row is not None and event.row == self._control_row:
+        # Control bar buttons. Still live during SEARCH — the control
+        # bar stays visible there (see `_build_layout`) so playback of
+        # whatever's already playing can keep being controlled while
+        # browsing search results, rather than going dead/decorative.
+        if self.mode in (ScreenMode.NORMAL, ScreenMode.SEARCH) and self._control_row is not None \
+                and event.row == self._control_row:
             segment = self._control_bar_segment_at(event.column)
             if segment:
                 self._dispatch_control_bar_click(segment)
@@ -448,12 +672,45 @@ class App:
 
     # -- layout building -----------------------------------------------
 
+    def _visualizer_height(self) -> int:
+        """Effective row-height of the spectrum region: `VISUALIZER_H`
+        while the visualizer is on, or 0 while it's off. Collapsing to
+        0 (rather than just leaving it blank) is what actually hands
+        those rows back to the art/info area above it — `layout["body"]`
+        has `ratio=1` so it expands to fill whatever the visualizer
+        region doesn't take.
+        """
+        return self.VISUALIZER_H if self.config.visualizer.enabled else 0
+
+    def _body_height(self) -> int:
+        """Rows available to the `body` row (art + info) once the fixed
+        header/visualizer/controls regions are subtracted. This is the
+        same number `Layout`'s `ratio=1` resolves `body` to internally
+        — but a `rich.panel.Panel` does NOT auto-stretch to match its
+        `Layout` region (it sizes to its own content and leaves the
+        rest of the region unpainted), so the cover art panel needs
+        this number handed to it explicitly (`height=`) to actually
+        reach all the way down instead of floating as a short box with
+        dead, transparent-looking space underneath it.
+        """
+        console_h = self.console.size.height
+        return max(1, console_h - (self.HEADER_H + self._visualizer_height() + self.CONTROLS_H))
+
     def _build_layout(self) -> Layout:
         theme = self.theme_mgr.current
         state = self.player.snapshot()
         track = self.player.current_track()
+        body_h = self._body_height()
 
-        current_size = (self.console.size.width, self.console.size.height)
+        # The visualizer's on/off state is part of the cache key here,
+        # not just console size: toggling it changes the art panel's
+        # available height (see `_visualizer_height`/`_art_columns`),
+        # so the ASCII frame has to be re-rendered at the new column/row
+        # count too — otherwise the old frame (fitted for the old,
+        # shorter or taller panel) gets stretched into the new panel
+        # shape by the terminal, which is what made the album border
+        # look "lonjong" (oval) whenever the spectrum was toggled.
+        current_size = (self.console.size.width, self.console.size.height, self.config.visualizer.enabled)
         size_changed = current_size != self._last_art_size
         if track and track.cover_path and (track.cover_path != self._last_cover or size_changed):
             self._ascii_frame = self.ascii_cache.get(
@@ -464,28 +721,46 @@ class App:
         elif track is None:
             self._ascii_frame = None
 
-        layout = Layout()
-        layout.split_column(
+        # NOTE: rich.layout's fixed-size resolver treats `size=0` as
+        # falsy and silently falls back to ratio-based sizing for that
+        # row (`_ratio.py` does `edge.size or None`) — passing
+        # `size=self._visualizer_height()` here when it's 0 doesn't
+        # "collapse" the visualizer row at all, it makes Rich split the
+        # remaining height 50/50 between "body" and "visualizer" (both
+        # end up ratio=1), which is exactly what was cutting the cover
+        # art / lyrics panel roughly in half whenever the visualizer was
+        # turned off. The only reliable way to actually zero out a row
+        # is to not create it in the first place.
+        visualizer_enabled = self.config.visualizer.enabled
+        rows = [
             Layout(name="header", size=self.HEADER_H),
             Layout(name="body", ratio=1),
-            Layout(name="visualizer", size=self.VISUALIZER_H),
-            Layout(name="controls", size=self.CONTROLS_H),
-        )
+        ]
+        if visualizer_enabled:
+            rows.append(Layout(name="visualizer", size=self.VISUALIZER_H))
+        rows.append(Layout(name="controls", size=self.CONTROLS_H))
+
+        layout = Layout()
+        layout.split_column(*rows)
         layout["body"].split_row(
             Layout(name="art", ratio=1),
             Layout(name="info", ratio=2),
         )
 
-        layout["header"].update(
-            Panel(Text(f"Swisky~", justify="center",
-                        style=f"bold {theme.accent}"), border_style=theme.border)
-        )
-        layout["art"].update(widgets.render_ascii_art(self._ascii_frame, theme))
+        layout["header"].update(self._render_header(theme))
+        layout["art"].update(widgets.render_ascii_art(self._ascii_frame, theme, height=body_h))
 
         now_playing = widgets.render_now_playing(track, theme)
         progress_bar = widgets.render_progress_bar(state.position, state.duration, theme)
 
-        if self.config.lyrics.enabled and self.config.lyrics.auto_scroll:
+        if self.mode == ScreenMode.SEARCH:
+            # Header is doing the input box now (see _render_header),
+            # so this panel only needs to carry status/results — art,
+            # visualizer and controls all stay put underneath so
+            # whatever's already playing keeps showing/playing while
+            # you search for the next thing.
+            layout["info"].update(self._render_search_results_panel(theme))
+        elif self.config.lyrics.enabled and self.config.lyrics.auto_scroll:
             info_body = Group(
                 now_playing,
                 Text(""),
@@ -493,16 +768,23 @@ class App:
                 Text(""),
                 widgets.render_lyrics(self.lyrics.state(), state.position, theme),
             )
+            # No border here on purpose — per the reference design, the
+            # cover art is the only bordered element in the body row;
+            # now playing/lyrics just sit directly on the background.
+            # `_progress_row`/`_progress_cols` below assume this exact
+            # padding (no border) — keep them in sync if this changes.
+            layout["info"].update(Padding(info_body, (1, 2)))
         else:
             info_body = Group(now_playing, Text(""), progress_bar)
-        layout["info"].update(Panel(info_body, border_style=theme.border, padding=(1, 2)))
+            layout["info"].update(Padding(info_body, (1, 2)))
 
-        if self.config.visualizer.enabled:
+        if visualizer_enabled:
             spec_frame = self.spectrum.decay() if state.paused else self.spectrum.analyze_at(state.position)
-        else:
-            spec_frame = None
-        vis_width = max(10, self.console.size.width - 4)
-        layout["visualizer"].update(widgets.render_visualizer(spec_frame, theme, vis_width, height=8))
+            vis_width = max(10, self.console.size.width - 4)
+            layout["visualizer"].update(widgets.render_visualizer(spec_frame, theme, vis_width, height=8))
+        # else: the row simply doesn't exist in this frame's layout (see
+        # the note above `rows = [...]`) — nothing to update, and "body"
+        # already absorbed the freed-up height via its ratio=1 split.
 
         _, control_bar_widths = self._control_bar_geometry()
         layout["controls"].update(
@@ -517,16 +799,19 @@ class App:
 
         # -- Hit regions for mouse support -----------------------------
         # Derived from the *fixed* row heights in the layout above
-        # (header=3, visualizer=10, controls=3) plus the known internal
-        # structure of the widgets those regions contain. Column split
-        # (art:info = 1:2) is approximate since Rich's ratio-resolver
-        # doesn't expose exact cell boundaries — close enough for a
-        # terminal mouse click.
-        HEADER_H, VISUALIZER_H, CONTROLS_H = self.HEADER_H, self.VISUALIZER_H, self.CONTROLS_H
+        # (header=3, visualizer=0 or 10 depending on whether it's on,
+        # controls=3) plus the known internal structure of the widgets
+        # those regions contain. Column split (art:info = 1:2) is
+        # approximate since Rich's ratio-resolver doesn't expose exact
+        # cell boundaries — close enough for a terminal mouse click.
+        HEADER_H, CONTROLS_H = self.HEADER_H, self.CONTROLS_H
         console_w, console_h = self.console.size.width, self.console.size.height
 
         info_panel_left = int(console_w * 1 / 3) + 1  # art:info ratio is 1:2
-        info_content_left = info_panel_left + 1 + 2    # +1 border, +2 padding
+        # The `info` column has no border anymore (see `_build_layout` —
+        # only the cover art panel is bordered), so content starts right
+        # after its `Padding(..., (1, 2))` — no "+1 border" term here.
+        info_content_left = info_panel_left + 2
 
         # Content line offsets inside the NOW PLAYING Group (see
         # widgets.render_now_playing): title, artist, blank, 1 info
@@ -534,10 +819,10 @@ class App:
         # more vertical room left for lyrics on short terminals),
         # blank, then the progress bar grid.
         PROGRESS_LINE_OFFSET = 7
-        self._progress_row = HEADER_H + 1 + 1 + PROGRESS_LINE_OFFSET  # +1 border, +1 padding-top
+        self._progress_row = HEADER_H + 1 + PROGRESS_LINE_OFFSET  # +1 padding-top (no border)
         # The bar itself sits after a 6-char time label + 1 space gutter.
         bar_left = info_content_left + 7
-        bar_right = console_w - 3 - 6  # panel right border/padding + trailing time label
+        bar_right = console_w - 2 - 6  # panel right padding (no border) + trailing time label
         self._progress_cols = (bar_left, max(bar_left + 1, bar_right))
 
         # Controls panel occupies the last CONTROLS_H rows; row +1 is the
@@ -548,6 +833,66 @@ class App:
         if overlay is not None:
             return Layout(overlay)
         return layout
+
+    def _render_header(self, theme) -> Panel:
+        """The header is a search bar, always. While `SEARCH` mode is
+        open this 3-row strip is the live query input; otherwise it's
+        an idle placeholder hinting at the 'o' shortcut that opens it.
+        The old static "Swisky~" wordmark panel was removed in favor
+        of this so the header stays a functional control instead of
+        just branding. Border color switches to accent while typing
+        so it's visually obvious the header is now an active input.
+        """
+        if self.mode == ScreenMode.SEARCH:
+            text = Text.assemble(
+                ("🔍 ", theme.accent),
+                ("Search:  ", f"bold {theme.text_secondary}"),
+                (f"{self.search_input}_", f"bold {theme.accent}"),
+            )
+            return Panel(text, border_style=theme.accent)
+        text = Text.assemble(
+            ("🔍 ", theme.text_muted),
+            ("Search for a track or artist…", theme.text_muted),
+            ("  (press 'o')", theme.text_muted),
+        )
+        return Panel(text, border_style=theme.border)
+
+    def _render_search_results_panel(self, theme):
+        """The `info` column while `SEARCH` mode is open. The query
+        itself lives in the header now (`_render_header`), so
+        `show_query=False` here to avoid showing it twice.
+
+        Borderless like the rest of the `info` column (see
+        `_build_layout`) — title/subtitle that a `Panel` would have
+        drawn on its border are folded into the body text instead.
+        """
+        if self.search_results:
+            body = widgets.render_search(
+                self.search_input, self.search_results, self.search_cursor,
+                self.search_status, theme, show_query=False,
+            )
+            heading = "RESULTS"
+            subtitle = "↑/↓ select · Enter play next · a add to queue · type to search again · Esc close"
+        elif self.search_status:
+            # Covers several states with one line: "Searching '...'",
+            # "Loading '...'", "Added '...' to queue", error text, or
+            # the "enable it in Settings" nudge — all just status
+            # text, not necessarily mid-search, hence the generic title.
+            body = Text(self.search_status, style=theme.text_secondary)
+            heading = "ONLINE SEARCH"
+            subtitle = "Esc close"
+        else:
+            body = Text("Type above, then press Enter to search.", style=theme.text_muted)
+            heading = "ONLINE SEARCH"
+            subtitle = "Esc close"
+        group = Group(
+            Text(heading, style=f"bold {theme.text_muted}"),
+            Text(""),
+            body,
+            Text(""),
+            Text(subtitle, style=theme.text_muted),
+        )
+        return Padding(group, (1, 2))
 
     def _build_overlay(self, theme):
         if self.mode == ScreenMode.COMMAND_PALETTE:
@@ -589,7 +934,7 @@ class App:
         # so tall covers could also overflow the panel's bottom edge.
         console_w, console_h = self.console.size.width, self.console.size.height
         art_panel_w = max(1, console_w // 3)
-        art_panel_h = max(1, console_h - (self.HEADER_H + self.VISUALIZER_H + self.CONTROLS_H))
+        art_panel_h = max(1, console_h - (self.HEADER_H + self._visualizer_height() + self.CONTROLS_H))
 
         # Panel chrome: border (1 each side) + padding=(0, 1) (1 each
         # side horizontally, 0 vertically) from render_ascii_art.

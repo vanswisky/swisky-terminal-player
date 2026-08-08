@@ -134,4 +134,24 @@ SETTINGS_ITEMS: list[SettingItem] = [
         display=lambda c: "ON" if c.lyrics.auto_scroll else "OFF",
         change=lambda c, d: setattr(c.lyrics, "auto_scroll", not c.lyrics.auto_scroll),
     ),
+    SettingItem(
+        key="lyrics_auto_fetch",
+        label="Auto-fetch Lyrics",
+        display=lambda c: "ON" if c.lyrics.auto_fetch else "OFF",
+        change=lambda c, d: setattr(c.lyrics, "auto_fetch", not c.lyrics.auto_fetch),
+    ),
+    SettingItem(
+        key="online_enabled",
+        label="Online Search",
+        display=lambda c: "ON" if c.online.enabled else "OFF",
+        change=lambda c, d: setattr(c.online, "enabled", not c.online.enabled),
+    ),
+    SettingItem(
+        key="online_results",
+        label="Search Results",
+        display=lambda c: str(c.online.search_results),
+        change=lambda c, d: setattr(
+            c.online, "search_results", int(_clamp(c.online.search_results + d, 3, 20))
+        ),
+    ),
 ]

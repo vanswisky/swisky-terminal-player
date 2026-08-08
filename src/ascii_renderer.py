@@ -40,7 +40,7 @@ try:
 except ImportError:  # pragma: no cover - optional acceleration
     _HAS_CV2 = False
 
-from config import AsciiConfig, AsciiQuality, AsciiRenderMode, ColorMode, ASCII_QUALITY_COLUMNS
+from config import AsciiConfig, AsciiRenderMode, ColorMode, ASCII_QUALITY_COLUMNS
 from constants import ASCII_CLASSIC_RAMP, ASCII_BLOCK_RAMP, BRAILLE_DOT_MAP
 
 logger = logging.getLogger(__name__)
@@ -292,7 +292,15 @@ class AsciiRenderer:
     def _quantized_color(self, rgb_px) -> tuple[int, int, int]:
         r, g, b = (int(v) for v in rgb_px[:3])
         if self.config.color_mode == ColorMode.MONOCHROME:
-            return (0, 0, 0)  # caller should use theme accent instead; see widgets.py
+            # True grayscale (luminance-weighted), not literal black —
+            # (0, 0, 0) painted every glyph invisible against the
+            # near-black theme backgrounds (see theme.py), so Monochrome
+            # mode silently rendered nothing. widgets.py has no theme
+            # override for this either; the fix belongs here so
+            # AsciiRenderer stays the single source of truth for cell
+            # color regardless of caller.
+            gray = round(0.2126 * r + 0.7152 * g + 0.0722 * b)
+            return (gray, gray, gray)
         if self.config.color_mode == ColorMode.ANSI256:
             # Quantize to a 6x6x6 color cube then expand back to RGB —
             # approximates xterm-256 palette while keeping TrueColor

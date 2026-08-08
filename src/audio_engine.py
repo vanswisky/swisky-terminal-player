@@ -161,10 +161,32 @@ class AudioEngine:
 
     # -- transport ---------------------------------------------------
 
-    def load(self, path: str) -> None:
+    def load(self, path: str, http_headers: list[str] | None = None) -> None:
+        """`http_headers` is a list of pre-formatted `"Key: Value"`
+        entries — set for online-resolved tracks whose CDN 403s
+        without a matching User-Agent/Referer, `None`/empty for local
+        files.
+
+        This is set as a genuine mpv list-option *property*
+        (`self._mpv["http-header-fields"] = [...]`), not passed as a
+        per-file option through `loadfile(..., http_header_fields=...)`.
+        The latter builds one big `"key=value,key=value"` options
+        string for the whole `loadfile` call, and mpv's own
+        `http-header-fields` value is *itself* a comma-separated list
+        of headers — so a header value containing a comma collides
+        with the options-string's own comma separator, and mpv rejects
+        the entire command with "Invalid value for mpv parameter"
+        (error -4). Setting it as a property instead hands mpv a
+        proper list (python-mpv converts a Python list straight into
+        an MPV node array), so there's no text to escape in the first
+        place.
+        """
         with self._lock:
             self._state.path = path
             self._eof_pending = False
+        # Always set (even to `[]`) so headers from a previous online
+        # track can't leak into the next (possibly local) one.
+        self._mpv["http-header-fields"] = list(http_headers) if http_headers else []
         self._mpv.play(path)
         self._mpv.pause = False
 

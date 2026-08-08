@@ -126,7 +126,7 @@ THEMES: dict[str, Theme] = {
     "green": GREEN,
     "amber": AMBER,
     "red": RED,
-    "Charcoal/Zinc": NEUTRAL
+    "neutral": NEUTRAL,
 }
 
 DEFAULT_THEME_NAME = "purple"

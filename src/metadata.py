@@ -14,8 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from mutagen import File as MutagenFile
-from mutagen.id3 import ID3, APIC
-from mutagen.flac import FLAC, Picture
+from mutagen.flac import FLAC
 from mutagen.mp4 import MP4
 
 from constants import COVERS_DIR
@@ -37,6 +36,24 @@ class TrackMetadata:
     sample_rate: int = 0      # Hz
     cover_path: str | None = None
     date_added: float = 0.0
+    # Set for tracks resolved via online_source.py instead of the local
+    # library scanner. `path` for these is a (usually short-lived,
+    # signed) direct stream URL rather than a filesystem path — code
+    # that does filesystem operations on `path` (scanner, file_hash,
+    # lyrics-by-file-stem lookup) must check this flag first.
+    is_online: bool = False
+    # The original webpage URL (e.g. the resolved YouTube watch page
+    # that supplied the audio) — kept for
+    # reference/debugging, never used for playback.
+    source_url: str | None = None
+    # A list of pre-formatted "Key: Value" entries mpv needs to fetch
+    # the stream URL above (some CDNs 403 without a matching
+    # User-Agent/Referer). None/empty for local files. Kept as a list
+    # (not a joined string) because AudioEngine.load() sets this as a
+    # native mpv list-option property — a joined string would collide
+    # with mpv's own comma-separated header format once passed through
+    # a per-file options string (see AudioEngine.load()'s docstring).
+    stream_headers: list[str] | None = None
 
 
 def _first(value):

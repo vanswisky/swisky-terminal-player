@@ -26,3 +26,12 @@ psutil>=5.9.8
 
 # Terminal input (raw keyboard + mouse escape-sequence parsing)
 readchar>=4.0.6
+
+# Online search/playback: search hits the iTunes Search API for
+# metadata (no API key/account needed — falls back to a plain YouTube
+# search if iTunes has nothing), then resolves a real playable audio
+# stream URL from a matching YouTube video (used by online_source.py).
+# Everything here uses only the standard library (urllib) plus
+# yt-dlp — no extra dependency, no credentials to configure.
+# Auto-fetched lyrics (lyrics_manager.py) also only need urllib.
+yt-dlp>=2024.8.6

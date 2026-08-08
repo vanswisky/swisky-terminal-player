@@ -1,73 +1,17 @@
-<div align="center">
+# Swisky Terminal Player
 
-#  ✨Swisky Terminal Player
+A fully terminal-based music player that delivers a desktop-class experience —
+ultra-high-fidelity TrueColor ASCII album art, a real-time FFT spectrum
+visualizer, synchronized lyrics, and a VS Code-style command palette — without
+ever leaving your terminal.
 
-### A music player that refuses to leave the terminal.
+![style](https://img.shields.io/badge/style-cyberpunk-b05cff)
+![python](https://img.shields.io/badge/python-3.12%2B-blue)
+![license](https://img.shields.io/badge/license-MIT-green)
 
-**Desktop-class playback. Cyberpunk visuals. Real-time audio.
-Ultra-detailed colored ASCII. Synchronized lyrics. Zero GUI.**
+![preview](preview.png)
 
-[![Style](https://img.shields.io/badge/style-cyberpunk-b05cff?style=for-the-badge)](#-highlights)
-[![Python](https://img.shields.io/badge/python-3.12%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)](#-requirements)
-[![License](https://img.shields.io/badge/license-MIT-2ea44f?style=for-the-badge)](#-license)
-
-<br>
-
-![Swisky Terminal Player preview](preview.png)
-
-<br>
-
-> **Your terminal is the interface. Your music is the experience.**
-
-</div>
-
----
-
-## 🧠 What is Swisky Terminal Player?
-
-**Swisky Terminal Player** is a full-screen Linux music player built entirely for the terminal.
-
-It brings album art, synchronized lyrics, playback controls, queues, themes, visualizers, command search, and mouse interaction into a responsive **24-bit TrueColor terminal UI**.
-
-No Electron. No Qt. No GTK. **No decorative controls pretending to work.**
-
-```text
-┌─────────────────────────────────────────────────────────────┐
-│                     YOUR MUSIC LIBRARY                      │
-│                              ↓                              │
-│                    ┌─────────────────┐                      │
-│                    │  Swisky Engine  │                      │
-│                    └────────┬────────┘                      │
-│                             ↓                               │
-│       ┌──────────────┬──────┴──────┬──────────────┐         │
-│       ↓              ↓             ↓              ↓         │
-│   ASCII ART       LYRICS       FFT AUDIO       PLAYER       │
-│       │              │             │              │         │
-│       └──────────────┴──────┬──────┴──────────────┘         │
-│                             ↓                               │
-│                    ✨ TERMINAL UI ✨                        │
-└─────────────────────────────────────────────────────────────┘
-```
-
-## 🎬 The Experience
-
-The player is built around a simple rule: **if it appears on screen, it should do something.**
-
-| Experience | What you get |
-|---|---|
-| 🎨 Album Art | High-fidelity colored ASCII, Block and Braille modes |
-| 🎵 Playback | Real `libmpv` playback for common lossless and lossy formats |
-| 📊 Visualizer | FFT spectrum derived from the actual audio |
-| 🎤 Lyrics | `.lrc` synchronization, auto-scroll and manual offset |
-| ⚡ Commands | VS Code-style `Ctrl+P` command palette |
-| 📚 Library | Recursive scanning with hot reload |
-| 📋 Queue | Select, play, reorder and remove tracks |
-| ⚙️ Settings | Interactive settings with persistence |
-| 🖱️ Mouse | Progress seeking and volume scrolling when supported |
-
----
-
-## 💫 Highlights
+## Highlights
 
 - **98–99%-fidelity ASCII album art** via a full image-enhancement pipeline
   (Lanczos → CLAHE → histogram equalization → auto contrast → adaptive
@@ -87,14 +31,14 @@ The player is built around a simple rule: **if it appears on screen, it should d
   `theme purple`, `ascii braille`, `scan library`, etc.
 - **Every visible control is real.** No decorative panels, no dummy buttons.
 
-## 🛠️ Requirements
+## Requirements
 
 - Arch Linux (or any modern Linux distro)
 - Python 3.12+
 - `libmpv` — `sudo pacman -S mpv`
 - A TrueColor terminal: Kitty, Ghostty, WezTerm, or Alacritty
 
-## 🚀 Install
+## Install
 
 ```bash
 git clone https://github.com/vanswisky/swisky-terminal-player
@@ -103,7 +47,7 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## ▶️ Run
+## Run
 
 ```bash
 python src/main.py                      # scans ./assets/music by default
@@ -113,7 +57,7 @@ python src/main.py ~/Music ~/Downloads  # or point it at your own folders
 Drop `.lrc` files into `assets/lyrics/<track-filename>.lrc` (or right next to
 the audio file) for synchronized lyrics.
 
-## 🎛️ Keyboard shortcuts
+## Keyboard shortcuts
 
 | Key                  | Action                      |
 |-----------------------|------------------------------|
@@ -127,35 +71,17 @@ the audio file) for synchronized lyrics.
 | `L`                   | Toggle lyrics                  |
 | `A`                   | Cycle ASCII render mode        |
 | `C`                   | Reload album cover              |
-| `V`                   | Toggle visualizer               |
+| `V`                   | Toggle visualizer (off = wider cover/lyrics area) |
 | `Ctrl+P`              | Open command palette             |
 | `Esc`                 | Open settings                    |
 | `Q`                   | Quit                              |
-
-## 🌟 Command Palette
-
-Press **`Ctrl+P`** to control the player without hunting through menus:
-
-```text
-seek 01:35
-volume 80
-theme purple
-ascii braille
-scan library
-queue
-playlist
-```
-
-The command palette is part of the real control system, not a visual gimmick.
-
----
 
 Mouse: click the progress bar to seek, scroll anywhere to adjust volume
 (terminal mouse reporting required — enabled automatically if supported).
 Click **QUEUE** on the control bar (or run `queue` / `playlist` in the
 command palette) to open the queue screen.
 
-### 📋 Queue screen
+### Queue screen
 
 | Key                  | Action                        |
 |-----------------------|--------------------------------|
@@ -165,7 +91,7 @@ command palette) to open the queue screen.
 | `D` / `Backspace`     | Remove the selected track       |
 | `Esc`                 | Close                            |
 
-### ⚙️ Settings screen
+### Settings screen
 
 | Key                  | Action                        |
 |-----------------------|--------------------------------|
@@ -173,22 +99,46 @@ command palette) to open the queue screen.
 | `←` / `→`             | Change the selected setting     |
 | `Esc`                 | Close and save                   |
 
-## 🧪 Quick Start
+### Online search (iTunes metadata, YouTube audio)
 
-```bash
-git clone https://github.com/vanswisky/swisky-terminal-player
-cd swisky-terminal-player
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-python src/main.py
-```
+The header strip is a search bar at all times — press `o`, or run
+`online <query>` in the command palette, and it turns into the live
+query input; art, visualizer, and controls all stay visible
+underneath, so whatever's already playing keeps going while you look
+for the next thing.
 
-Then drop music into `assets/music` and launch. For synchronized lyrics, add an `.lrc` file under `assets/lyrics` or beside the audio file.
+Searching queries the iTunes Search API — no API key, no account, no
+sign-up, just a plain request — so results are properly tagged (real
+title/artist/album/cover). If iTunes has nothing for a query (common
+for obscure or very indie tracks), it transparently falls back to a
+plain YouTube search instead, so you're never left with zero results.
+Either way, the moment you pick a result, the player looks up a
+matching video on YouTube behind the scenes and streams the audio from
+there — the metadata and cover you see stay from iTunes when available,
+only the audio source is YouTube.
 
----
+| Key                  | Action                        |
+|-----------------------|--------------------------------|
+| *(typing)*            | Builds the query                |
+| `Enter`               | Search, or play the selected result |
+| `↑` / `↓`             | Select a result                 |
+| `a`                   | Add selected result to queue (don't switch playback) |
+| *(typing again)*      | Clears results, starts a fresh query |
+| `Esc`                 | Close                            |
 
-## 🧩 Architecture
+Requires `yt-dlp` (`pip install -r requirements.txt`) and
+`online.enabled` in Settings. No API keys or accounts needed for
+either the iTunes search step or the YouTube fallback search.
+
+Streaming the resolved audio from YouTube this way sits in a legal
+gray area relative to their ToS — fine for personal use, just worth
+knowing.
+
+Streaming the resolved audio from YouTube this way sits in a legal
+gray area relative to their ToS — fine for personal use, just worth
+knowing.
+
+## Architecture
 
 Each module has one job; nothing here is a monolith.
 
@@ -206,7 +156,14 @@ src/
 
   metadata.py           mutagen-based tag + embedded cover extraction
   scanner.py            recursive library scan + watchdog hot-reload
-  lyrics_manager.py     .lrc parsing + time-synced active-line lookup
+  lyrics_manager.py     .lrc parsing + time-synced active-line lookup,
+                         falls back to fetching from lrclib.net when no
+                         local file exists (cached to disk after)
+  online_source.py      iTunes search (metadata) + YouTube stream
+                         resolution (yt-dlp), two-phase: cheap iTunes
+                         search (falls back to YouTube search if
+                         empty), then a per-track YouTube resolve for
+                         the real stream URL + headers
 
   ascii_renderer.py     THE core engine: image pipeline -> ASCII/Braille/Block
   ascii_cache.py         memory + disk caching keyed on (cover, size, mode, quality)
@@ -223,7 +180,7 @@ src/
   utils.py               dependency-free helpers (time fmt, hashing, term size)
 ```
 
-### 🔬 Why the ASCII renderer looks the way it does
+### Why the ASCII renderer looks the way it does
 
 Classic "brightness → character" ASCII art assumes dark ink on light paper.
 On a terminal, we're drawing colored glyphs on a *black* background, so the
@@ -234,7 +191,7 @@ in local edge strength (Sobel gradient magnitude), so structural detail —
 eyes, hairlines, jaw edges — stays legible even in flat-brightness regions
 instead of washing out.
 
-### 📊 Why the visualizer doesn't tap mpv's audio pipeline directly
+### Why the visualizer doesn't tap mpv's audio pipeline directly
 
 `libmpv` doesn't expose a simple "give me the raw samples currently playing"
 hook. Instead, `visualizer.py` decodes the track's PCM once (on a background
@@ -243,21 +200,7 @@ that corresponds to mpv's *reported playback position*, FFTs it, and bins it
 into log-spaced bands. The result tracks the real audio; it just gets there
 by re-reading the same file rather than intercepting mpv's internals.
 
-## 🧭 Project Philosophy
-
-```text
-FUNCTION OVER DECORATION
-MODULARITY OVER MONOLITHS
-REAL AUDIO OVER FAKE ANIMATIONS
-TERMINAL NATIVE OVER GUI IMITATION
-VISUAL QUALITY WITHOUT LOSING CONTROL
-```
-
-The goal is not to imitate a desktop player inside a terminal. The goal is to build a serious player **whose native environment is the terminal itself**.
-
----
-
-## 🧱 Extending
+## Extending
 
 - Add a new ASCII mode: add an entry to `AsciiRenderMode` in `config.py` and
   a `_render_xxx` method in `ascii_renderer.py`.
@@ -265,15 +208,6 @@ The goal is not to imitate a desktop player inside a terminal. The goal is to bu
   call in `ui.py`'s `_register_commands`.
 - Add a theme: one new `Theme(...)` instance in `theme.py`.
 
-## 📜 License
+## License
 
 MIT — see `LICENSE`.
----
-
-<div align="center">
-
-### Made for people who like their music player one `Ctrl+P` away from the terminal.
-
-**Swisky Terminal Player** ✨
-
-</div>

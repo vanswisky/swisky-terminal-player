@@ -83,6 +83,18 @@ class LyricsConfig:
     enabled: bool = True
     auto_scroll: bool = True
     offset_ms: int = 0
+    # When no local .lrc is found, look one up on lrclib.net (a free,
+    # open lyrics database — no API key needed) and cache it to
+    # LYRICS_DIR for next time. Runs in a background thread so it
+    # never blocks playback; see lyrics_manager.py.
+    auto_fetch: bool = True
+
+
+@dataclass(slots=True)
+class OnlineConfig:
+    enabled: bool = True
+    # How many results to show for a single `online <query>` search.
+    search_results: int = 8
 
 
 @dataclass(slots=True)
@@ -92,6 +104,7 @@ class AppConfig:
     visualizer: VisualizerConfig = field(default_factory=VisualizerConfig)
     playback: PlaybackConfig = field(default_factory=PlaybackConfig)
     lyrics: LyricsConfig = field(default_factory=LyricsConfig)
+    online: OnlineConfig = field(default_factory=OnlineConfig)
     ui_fps: int = 30
     mouse_enabled: bool = True
     library_paths: list[str] = field(default_factory=list)
@@ -145,5 +158,12 @@ class AppConfig:
             enabled=l.get("enabled", cfg.lyrics.enabled),
             auto_scroll=l.get("auto_scroll", cfg.lyrics.auto_scroll),
             offset_ms=l.get("offset_ms", cfg.lyrics.offset_ms),
+            auto_fetch=l.get("auto_fetch", cfg.lyrics.auto_fetch),
+        )
+
+        o = d.get("online", {})
+        cfg.online = OnlineConfig(
+            enabled=o.get("enabled", cfg.online.enabled),
+            search_results=o.get("search_results", cfg.online.search_results),
         )
         return cfg

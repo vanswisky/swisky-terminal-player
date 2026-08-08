@@ -72,7 +72,7 @@ def main() -> None:
 
     theme_mgr = ThemeManager(config.theme)
 
-    lyrics = LyricsManager(offset_ms=config.lyrics.offset_ms)
+    lyrics = LyricsManager(offset_ms=config.lyrics.offset_ms, auto_fetch=config.lyrics.auto_fetch)
     player = Player(config.playback, lyrics)
 
     ascii_renderer = AsciiRenderer(config.ascii)

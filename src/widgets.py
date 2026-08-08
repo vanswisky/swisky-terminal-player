@@ -31,17 +31,38 @@ from visualizer import SpectrumFrame
 # ASCII album art
 # --------------------------------------------------------------------------
 
-def render_ascii_art(frame: AsciiFrame | None, theme: Theme) -> Panel:
+def render_ascii_art(frame: AsciiFrame | None, theme: Theme, height: int | None = None) -> Panel:
+    """`height`, when given, is the *outer* panel height (border rows
+    included) to force — a `rich.panel.Panel` sizes itself to its own
+    content by default and does NOT stretch to fill whatever `Layout`
+    region it's placed in, so without this the panel's border would
+    only wrap tightly around the ASCII art and leave the rest of a
+    taller region (e.g. after the spectrum is turned off and the body
+    row grows) unpainted/blank underneath it.
+
+    Centering (rather than stretching) the art inside that forced
+    height is what keeps the cover itself square/undistorted — only
+    the surrounding border grows, never the image.
+    """
     if frame is None:
-        body = Align.center(
-            Text("No cover art", style=theme.text_muted), vertical="middle"
-        )
+        inner = Text("No cover art", style=theme.text_muted)
     else:
-        body = Text.from_ansi(frame.ansi_text)
+        inner = Text.from_ansi(frame.ansi_text)
+
+    if height is not None:
+        # Panel chrome here is a 1-char border on top/bottom (padding
+        # is horizontal-only: `padding=(0, 1)`), so the interior has
+        # exactly `height - 2` rows to center within.
+        inner_height = max(1, height - 2)
+        body = Align(inner, align="center", vertical="middle", height=inner_height)
+    else:
+        body = Align.center(inner, vertical="middle")
+
     return Panel(
         body,
         border_style=theme.border,
         padding=(0, 1),
+        height=height,
     )
 
 
@@ -101,7 +122,8 @@ def render_progress_bar(position: float, duration: float, theme: Theme) -> Table
 
 def render_lyrics(state: LyricsState, position: float, theme: Theme, context: int = 3) -> Group:
     if not state.available:
-        return Group(Text("LYRICS", style=f"bold {theme.text_muted}"), Text("No synced lyrics found", style=theme.text_muted))
+        status = "Searching online for lyrics..." if state.fetching else "No synced lyrics found"
+        return Group(Text("LYRICS", style=f"bold {theme.text_muted}"), Text(status, style=theme.text_muted))
 
     active = state.active_index(position)
     lines = []
@@ -257,6 +279,52 @@ def render_queue(
             style=row_style,
         )
     return table
+
+
+def render_search(
+    query: str, results, cursor: int, status: str, theme: Theme, show_query: bool = True
+) -> Group:
+    """Online (iTunes search, YouTube audio) search screen: an optional typed-query line,
+    an optional status/spinner line (searching / resolving / error),
+    and a results table once `search()` has returned something.
+    `results` holds `online_source.OnlineSearchResult` objects — only
+    duck-typed here (`.title` / `.artist` / `.duration`) so this widget
+    doesn't need to import that module just to draw.
+
+    `show_query=False` skips the query line entirely — used when the
+    header itself is doing double duty as the live input box (see
+    `ui.py::_build_search_layout`), so the query isn't shown twice.
+    """
+    parts: list = []
+    if show_query:
+        parts.append(Text(f"🔍 {query}_", style=f"bold {theme.accent}"))
+    if status:
+        parts.append(Text(status, style=theme.text_muted))
+
+    if results:
+        table = Table(expand=True, border_style=theme.border, header_style=f"bold {theme.text_muted}")
+        table.add_column("#", width=4)
+        table.add_column("Title")
+        table.add_column("Channel")
+        table.add_column("Dur", width=6, justify="right")
+        for i, result in enumerate(results):
+            selected = i == cursor
+            style = f"bold {theme.accent}" if selected else theme.text_secondary
+            marker = "▶" if selected else str(i + 1)
+            row_style = f"on {theme.surface}" if selected else None
+            table.add_row(
+                Text(marker, style=style),
+                Text(result.title, style=style, overflow="ellipsis"),
+                Text(result.artist, style=style, overflow="ellipsis"),
+                Text(format_time(result.duration), style=style),
+                style=row_style,
+            )
+        parts.append(Text(""))
+        parts.append(table)
+    elif not status:
+        parts.append(Text("Type a query and press Enter to search.", style=theme.text_muted))
+
+    return Group(*parts)
 
 
 # --------------------------------------------------------------------------
