@@ -150,6 +150,8 @@ class KeyboardHandler:
                 self._queue.put("CTRL_P")
             elif char == " ":
                 self._queue.put("SPACE")
+            elif char == "\t":
+                self._queue.put("TAB")
             elif char in ("\r", "\n"):
                 self._queue.put("ENTER")
             elif char == "\x7f" or char == "\x08":

@@ -11,7 +11,21 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import shutil
+
+_UNSAFE_FILENAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def safe_filename(text: str, max_len: int = 150) -> str:
+    """Strip characters that aren't safe in a filename (path
+    separators, control chars, Windows-reserved punctuation) so
+    arbitrary user/online-sourced text — a playlist title, a track
+    name — can be used as a save file's name without escaping the
+    intended directory or failing outright on some filesystems.
+    """
+    cleaned = _UNSAFE_FILENAME_RE.sub("_", text).strip()
+    return cleaned[:max_len] or "untitled"
 
 
 def format_time(seconds: float) -> str:

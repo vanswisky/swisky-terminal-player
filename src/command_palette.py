@@ -32,7 +32,7 @@ class CommandPalette:
         "theme purple", "theme blue", "theme green", "theme amber", "theme red",
         "ascii braille", "ascii block", "ascii classic", "ascii ultra",
         "reload cover", "reload lyrics", "scan library", "playlist", "queue",
-        "mute", "speed 1.25", "fullscreen", "exit",
+        "online playlist", "mute", "speed 1.25", "fullscreen", "exit",
     ]
 
     def __init__(self) -> None:

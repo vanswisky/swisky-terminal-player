@@ -154,4 +154,19 @@ SETTINGS_ITEMS: list[SettingItem] = [
             c.online, "search_results", int(_clamp(c.online.search_results + d, 3, 20))
         ),
     ),
+    SettingItem(
+        key="online_playlist_limit",
+        label="Playlist Import Limit",
+        display=lambda c: str(c.online.playlist_track_limit),
+        change=lambda c, d: setattr(
+            c.online, "playlist_track_limit",
+            int(_clamp(c.online.playlist_track_limit + d * 5, 5, 100)),
+        ),
+    ),
+    SettingItem(
+        key="online_auto_cleanup",
+        label="Auto-clean Online Cache",
+        display=lambda c: "ON" if c.online.auto_cleanup else "OFF",
+        change=lambda c, d: setattr(c.online, "auto_cleanup", not c.online.auto_cleanup),
+    ),
 ]

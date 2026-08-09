@@ -117,6 +117,14 @@ matching video on YouTube behind the scenes and streams the audio from
 there — the metadata and cover you see stay from iTunes when available,
 only the audio source is YouTube.
 
+Importing a whole online playlist (`online playlist <query>`, or TAB
+inside the search screen) uses the same iTunes metadata source per
+track — each YouTube-listed track is looked up on iTunes and, where a
+match is found, gets iTunes' clean title/artist/album/cover instead of
+the raw YouTube upload title (still falling back to the YouTube-parsed
+metadata for anything iTunes has nothing for). The audio itself is
+still always resolved from YouTube.
+
 | Key                  | Action                        |
 |-----------------------|--------------------------------|
 | *(typing)*            | Builds the query                |

@@ -15,13 +15,41 @@ actually playing rather than a generic animation.
 
 Decoding happens on a background thread so large FLACs don't block
 track-start.
+
+Online tracks (`track.path` is an http(s) stream URL, not a local
+file) can't be handed to `soundfile` directly — libsndfile has no
+HTTP support, and YouTube's CDN 403s without the same User-Agent/
+Referer headers mpv itself needs (see `audio_engine.py`'s `load()`
+docstring). `load_async` downloads such a URL to a small scratch temp
+file first (same headers as playback), decodes that, then deletes it
+— a few seconds' extra wait the first time a track starts, same as
+mpv's own initial buffering, not a per-frame cost.
+
+`soundfile` (libsndfile) also can't decode the *codec* almost every
+online track actually downloads as: `online_source.resolve()` asks
+yt-dlp for `bestaudio[ext=m4a]/bestaudio/best`, which resolves to an
+AAC/M4A stream (or Opus/WebM when m4a isn't offered) essentially every
+time — libsndfile has no AAC/Opus decoder, so `sf.read()` raises for
+every single online or imported-playlist track, `_mono` is left
+`None`, and the spectrum silently sits flat/decaying forever. This is
+invisible in day-to-day local-library use because those files are
+overwhelmingly MP3/FLAC, which libsndfile does read — the gap only
+shows up once something is actually streamed. `_decode` below falls
+back to `audioread` (already a declared dependency in
+requirements.txt — decodes via whatever the system already has,
+ffmpeg/gstreamer/etc., i.e. the same codecs mpv itself can play) for
+exactly this case, instead of giving up the moment `soundfile` fails.
 """
 
 from __future__ import annotations
 
 import logging
+import tempfile
 import threading
+import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
+from urllib.parse import urlparse
 
 import numpy as np
 
@@ -31,12 +59,69 @@ try:
 except ImportError:  # pragma: no cover
     _HAS_SOUNDFILE = False
 
+try:
+    import audioread
+    _HAS_AUDIOREAD = True
+except ImportError:  # pragma: no cover
+    _HAS_AUDIOREAD = False
+
 from config import VisualizerConfig
 
 logger = logging.getLogger(__name__)
 
 ANALYSIS_SAMPLE_RATE = 22050  # downsample target — plenty for visual bands
 WINDOW_SECONDS = 2048 / ANALYSIS_SAMPLE_RATE
+
+# Safety cap on how much of an online stream gets downloaded for
+# analysis — comfortably more than any normal song at any bitrate, but
+# stops a misidentified livestream (or a stream that never ends) from
+# reading forever on a background thread.
+_MAX_DOWNLOAD_BYTES = 40 * 1024 * 1024
+
+
+def _is_url(path: str) -> bool:
+    return path.startswith("http://") or path.startswith("https://")
+
+
+def _decode_with_audioread(path: str) -> tuple[np.ndarray, int]:
+    """Fallback PCM decode for anything `soundfile` can't open — in
+    practice this is the codec path for every online/playlist track
+    (see module docstring). `audioread` hands back fixed-size chunks
+    of interleaved signed 16-bit PCM bytes; this concatenates them and
+    reshapes into the same `(frames, channels) float32 in [-1, 1]`
+    shape `soundfile.read(..., always_2d=True)` produces, so nothing
+    downstream of this needs to know which decoder actually ran.
+    """
+    with audioread.audio_open(path) as f:
+        sr = f.samplerate
+        channels = max(1, f.channels)
+        raw = bytearray()
+        for block in f:
+            raw.extend(block)
+
+    if not raw:
+        raise RuntimeError("audioread decoded zero samples")
+
+    samples = np.frombuffer(bytes(raw), dtype="<i2").astype(np.float32) / 32768.0
+    # audioread's last block can be short of a full frame across all
+    # channels — trim to a whole number of frames before reshaping.
+    frame_count = len(samples) // channels
+    samples = samples[: frame_count * channels].reshape(frame_count, channels)
+    return samples, sr
+
+
+def _headers_to_dict(header_list: list[str] | None) -> dict[str, str]:
+    """`track.stream_headers` is a list of `"Key: Value"` strings (see
+    `online_source.resolve` / `audio_engine.py`'s `load()` docstring
+    for why it's that shape rather than a dict already) — this just
+    reshapes it for `urllib.request.Request`.
+    """
+    headers: dict[str, str] = {}
+    for entry in header_list or []:
+        if ":" in entry:
+            key, _, value = entry.partition(":")
+            headers[key.strip()] = value.strip()
+    return headers
 
 
 @dataclass(slots=True)
@@ -67,22 +152,95 @@ class SpectrumAnalyzer:
         # even spread (bass doesn't dominate half the display).
         self._band_edges = np.geomspace(40, ANALYSIS_SAMPLE_RATE / 2 - 1, config.band_count + 1)
 
-    def load_async(self, path: str) -> None:
-        if not _HAS_SOUNDFILE:
-            logger.warning("soundfile not available; visualizer disabled")
+    def load_async(self, path: str, http_headers: list[str] | None = None) -> None:
+        if not _HAS_SOUNDFILE and not _HAS_AUDIOREAD:
+            logger.warning("Neither soundfile nor audioread available; visualizer disabled")
             return
         self._loading_path = path
-        thread = threading.Thread(target=self._decode, args=(path,), daemon=True)
+        thread = threading.Thread(target=self._decode, args=(path, http_headers), daemon=True)
         thread.start()
 
-    def _decode(self, path: str) -> None:
+    def _download_to_temp(self, url: str, http_headers: list[str] | None) -> str | None:
+        """Streams an online track's audio to a scratch temp file (see
+        module docstring for why). Deleted again by `_decode` right
+        after decoding — this is scratch space for one FFT pass, not a
+        cache, so it never touches `session_cleanup.py`.
+        """
+        headers = _headers_to_dict(http_headers) or {"User-Agent": "Mozilla/5.0"}
+        req = urllib.request.Request(url, headers=headers)
+        tmp_path: str | None = None
         try:
-            data, sr = sf.read(path, always_2d=True, dtype="float32")
+            suffix = Path(urlparse(url).path).suffix or ".audio"
+            fd, tmp_path = tempfile.mkstemp(suffix=suffix, prefix="swisky-vis-")
+            with urllib.request.urlopen(req, timeout=15) as resp, open(fd, "wb") as f:
+                written = 0
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    remaining = _MAX_DOWNLOAD_BYTES - written
+                    if remaining <= 0:
+                        logger.debug("Visualizer download for %s hit the size cap; truncating", url)
+                        break
+                    if len(chunk) > remaining:
+                        chunk = chunk[:remaining]
+                    f.write(chunk)
+                    written += len(chunk)
+            return tmp_path
+        except Exception as exc:  # noqa: BLE001 — no spectrum beats a crashed background thread
+            logger.debug("Visualizer could not fetch %s for analysis: %s", url, exc)
+            if tmp_path is not None:
+                Path(tmp_path).unlink(missing_ok=True)
+            return None
+
+    def _decode(self, path: str, http_headers: list[str] | None = None) -> None:
+        local_path = path
+        temp_path: str | None = None
+        try:
+            if _is_url(path):
+                temp_path = self._download_to_temp(path, http_headers)
+                if temp_path is None:
+                    with self._lock:
+                        if self._loading_path == path:
+                            self._mono = None
+                    return
+                local_path = temp_path
+
+            sf_error: Exception | None = None
+            data = sr = None
+            try:
+                data, sr = sf.read(local_path, always_2d=True, dtype="float32")
+            except Exception as exc:  # noqa: BLE001 — try the audioread fallback below first
+                sf_error = exc
+
+            if data is None:
+                # `soundfile`/libsndfile can't decode AAC/M4A or Opus/
+                # WebM — exactly what online-track downloads almost
+                # always are (see module docstring) — so this fallback
+                # is what actually makes the online/playlist spectrum
+                # work at all, not just a rare-format nicety.
+                if not _HAS_AUDIOREAD:
+                    raise sf_error or RuntimeError("soundfile returned no data")
+                try:
+                    data, sr = _decode_with_audioread(local_path)
+                except Exception as ar_exc:  # noqa: BLE001
+                    logger.warning(
+                        "Visualizer could not decode %s (soundfile: %s; audioread: %s)",
+                        path, sf_error, ar_exc,
+                    )
+                    with self._lock:
+                        if self._loading_path == path:
+                            self._mono = None
+                    return
         except Exception as exc:  # noqa: BLE001
             logger.warning("Visualizer could not decode %s: %s", path, exc)
             with self._lock:
-                self._mono = None
+                if self._loading_path == path:
+                    self._mono = None
             return
+        finally:
+            if temp_path is not None:
+                Path(temp_path).unlink(missing_ok=True)
 
         # Downsample (simple decimation is fine for visualization purposes).
         if sr > ANALYSIS_SAMPLE_RATE:

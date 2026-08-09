@@ -29,13 +29,14 @@ import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import session_cleanup
 from constants import LYRICS_DIR
 from metadata import TrackMetadata
+from utils import safe_filename
 
 logger = logging.getLogger(__name__)
 
 _LRC_TIME_RE = re.compile(r"\[(\d{1,2}):(\d{2})(?:[.:](\d{1,3}))?\]")
-_UNSAFE_FILENAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _LRCLIB_SEARCH_URL = "https://lrclib.net/api/search"
 
 
@@ -93,8 +94,7 @@ def parse_lrc(text: str) -> list[LyricLine]:
 
 
 def _sanitize_filename(text: str) -> str:
-    cleaned = _UNSAFE_FILENAME_RE.sub("_", text).strip()
-    return cleaned[:150] or "untitled"
+    return safe_filename(text)
 
 
 def _fetch_synced_lyrics_lrclib(title: str, artist: str) -> str | None:
@@ -194,6 +194,12 @@ class LyricsManager:
         try:
             LYRICS_DIR.mkdir(parents=True, exist_ok=True)
             cache_path.write_text(synced, encoding="utf-8")
+            # Only online tracks' lyric files are session-cleanup
+            # candidates — this same fetch path also runs for local
+            # library tracks with no bundled .lrc, and those are worth
+            # keeping around for next time they're played.
+            if track.is_online:
+                session_cleanup.track(cache_path)
         except OSError as exc:
             logger.warning("Failed to cache fetched lyrics to %s: %s", cache_path, exc)
 

@@ -18,6 +18,7 @@ import logging
 import pickle
 from pathlib import Path
 
+import session_cleanup
 from ascii_renderer import AsciiFrame, AsciiRenderer
 from config import AsciiConfig
 from constants import CACHE_DIR
@@ -65,6 +66,12 @@ class AsciiCache:
         self._memory[key] = frame
         try:
             disk_path.write_bytes(pickle.dumps(frame))
+            # online_source.py names covers it downloads "online-<hash>.jpg"
+            # (see `_cache_cover`) — anything rendered from one of those is
+            # itself an online-mode artifact, not a locally-scanned cover,
+            # so it's a session-cleanup candidate too.
+            if Path(image_path).name.startswith("online-"):
+                session_cleanup.track(disk_path)
         except OSError as exc:
             logger.warning("Could not write ASCII cache to disk: %s", exc)
         return frame

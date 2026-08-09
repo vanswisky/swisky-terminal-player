@@ -287,14 +287,19 @@ def render_queue(
 
 
 def render_search(
-    query: str, results, cursor: int, status: str, theme: Theme, show_query: bool = True
+    query: str, results, cursor: int, status: str, theme: Theme,
+    show_query: bool = True, mode: str = "track",
 ) -> Group:
-    """Online (iTunes search, YouTube audio) search screen: an optional typed-query line,
-    an optional status/spinner line (searching / resolving / error),
-    and a results table once `search()` has returned something.
-    `results` holds `online_source.OnlineSearchResult` objects — only
-    duck-typed here (`.title` / `.artist` / `.duration`) so this widget
-    doesn't need to import that module just to draw.
+    """Online search results screen: an optional typed-query line, an
+    optional status/spinner line (searching / resolving / error), and
+    a results table once a search has returned something.
+
+    `results` holds either `online_source.OnlineSearchResult` objects
+    (mode="track" — duck-typed on `.title`/`.artist`/`.duration`) or
+    `online_source.OnlinePlaylistResult` objects (mode="playlist" —
+    duck-typed on `.title`/`.owner`/`.track_count`) — only ever one
+    kind at a time, matching whichever search was last run. This
+    widget doesn't import `online_source` just to draw either shape.
 
     `show_query=False` skips the query line entirely — used when the
     header itself is doing double duty as the live input box (see
@@ -309,25 +314,43 @@ def render_search(
     if results:
         table = Table(expand=True, border_style=theme.border, header_style=f"bold {theme.text_muted}")
         table.add_column("#", width=4)
-        table.add_column("Title")
-        table.add_column("Channel")
-        table.add_column("Dur", width=6, justify="right")
+        if mode == "playlist":
+            table.add_column("Playlist")
+            table.add_column("Owner")
+            table.add_column("Tracks", width=7, justify="right")
+        else:
+            table.add_column("Title")
+            table.add_column("Channel")
+            table.add_column("Dur", width=6, justify="right")
         for i, result in enumerate(results):
             selected = i == cursor
             style = f"bold {theme.accent}" if selected else theme.text_secondary
             marker = "▶" if selected else str(i + 1)
             row_style = f"on {theme.surface}" if selected else None
-            table.add_row(
-                Text(marker, style=style),
-                Text(result.title, style=style, overflow="ellipsis"),
-                Text(result.artist, style=style, overflow="ellipsis"),
-                Text(format_time(result.duration), style=style),
-                style=row_style,
-            )
+            if mode == "playlist":
+                count = result.track_count
+                count_text = str(count) if count else "?"
+                table.add_row(
+                    Text(marker, style=style),
+                    Text(result.title, style=style, overflow="ellipsis"),
+                    Text(result.owner, style=style, overflow="ellipsis"),
+                    Text(count_text, style=style),
+                    style=row_style,
+                )
+            else:
+                table.add_row(
+                    Text(marker, style=style),
+                    Text(result.title, style=style, overflow="ellipsis"),
+                    Text(result.artist, style=style, overflow="ellipsis"),
+                    Text(format_time(result.duration), style=style),
+                    style=row_style,
+                )
         parts.append(Text(""))
         parts.append(table)
     elif not status:
-        parts.append(Text("Type a query and press Enter to search.", style=theme.text_muted))
+        hint = "Type a query and press Enter to search." if mode == "track" \
+            else "Type a query and press Enter to search playlists."
+        parts.append(Text(hint, style=theme.text_muted))
 
     return Group(*parts)
 

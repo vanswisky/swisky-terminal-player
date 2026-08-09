@@ -95,6 +95,13 @@ class OnlineConfig:
     enabled: bool = True
     # How many results to show for a single `online <query>` search.
     search_results: int = 8
+    # Max tracks pulled in when importing a whole online playlist —
+    # caps how long "load this playlist" can take.
+    playlist_track_limit: int = 25
+    # Delete covers/lyrics/ASCII renders created by online mode this
+    # run, on exit — keeps assets/{covers,lyrics,cache} from silently
+    # growing forever from tracks that were only ever played once.
+    auto_cleanup: bool = True
 
 
 @dataclass(slots=True)
@@ -165,5 +172,7 @@ class AppConfig:
         cfg.online = OnlineConfig(
             enabled=o.get("enabled", cfg.online.enabled),
             search_results=o.get("search_results", cfg.online.search_results),
+            playlist_track_limit=o.get("playlist_track_limit", cfg.online.playlist_track_limit),
+            auto_cleanup=o.get("auto_cleanup", cfg.online.auto_cleanup),
         )
         return cfg

@@ -26,6 +26,7 @@ from lyrics_manager import LyricsManager
 from playlist_manager import PlaylistManager
 from player import Player
 from scanner import LibraryScanner
+import session_cleanup
 from settings_manager import SettingsManager
 from theme_manager import ThemeManager
 from ui import App
@@ -110,6 +111,12 @@ def main() -> None:
         pass
     finally:
         settings.save()
+        # Runs on every exit path (normal quit, Ctrl+C, or an
+        # unhandled exception unwinding through here) so online-mode
+        # covers/lyrics/ASCII cache never outlive the terminal session
+        # they were downloaded for. See session_cleanup.py.
+        if config.online.auto_cleanup:
+            session_cleanup.cleanup()
 
 
 if __name__ == "__main__":

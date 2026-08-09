@@ -62,6 +62,7 @@ from scanner import LibraryScanner
 from settings_items import SETTINGS_ITEMS
 from settings_manager import SettingsManager
 from theme_manager import ThemeManager
+from utils import safe_filename
 from visualizer import SpectrumAnalyzer
 
 logger = logging.getLogger(__name__)
@@ -166,10 +167,23 @@ class App:
         self.search_results: list = []
         self.search_cursor = 0
         self.search_status = ""
+        # "track" (default, iTunes/YouTube single-track search) or
+        # "playlist" (YouTube playlist search — see search_playlists()
+        # in online_source.py). Toggled with TAB inside the Search
+        # screen, or set directly via the "online playlist QUERY"
+        # command-palette command. Only changes what `search_results`
+        # holds and how Enter/"a" interpret the selected row.
+        self.search_mode = "track"
         self._search_lock = threading.Lock()
         self._search_generation = 0
         self._pending_search_result = None
         self._pending_resolve = None
+        # Set while a picked playlist's tracks are being bulk-resolved
+        # (see _playlist_resolve_worker) so the search panel can show
+        # live "12/30" progress instead of going silent for however
+        # long the whole import takes.
+        self._playlist_progress: tuple[int, int] | None = None
+        self._pending_playlist_load = None
 
         # Hit regions for mouse support, recomputed each frame.
         self._progress_row: int | None = None
@@ -220,6 +234,13 @@ class App:
                     lambda m: self._rescan_library())
         cp.register(r"^playlist$", "playlist — open playlist browser", lambda m: self._set_mode(ScreenMode.QUEUE))
         cp.register(r"^queue$", "queue — open queue view", lambda m: self._set_mode(ScreenMode.QUEUE))
+        # Registered before the plain "online QUERY" pattern below —
+        # CommandPalette.execute matches patterns in registration order
+        # and stops at the first hit, and "online (.+)" would otherwise
+        # swallow "online playlist foo" too (its ".+" matches "playlist
+        # foo" just fine).
+        cp.register(r"^online playlist (.+)$", "online playlist QUERY — search whole playlists",
+                    lambda m: self._open_search(prefill=m.group(1), mode="playlist"))
         cp.register(r"^online (.+)$", "online QUERY — search for a track and open results",
                     lambda m: self._open_search(prefill=m.group(1)))
         cp.register(r"^exit$", "exit — quit the app", lambda m: self._quit())
@@ -228,7 +249,7 @@ class App:
 
     def _on_track_changed(self, track) -> None:
         if track is not None:
-            self.spectrum.load_async(track.path)
+            self.spectrum.load_async(track.path, http_headers=track.stream_headers)
             self._last_cover = None  # force ASCII re-render on next frame
 
     def _set_theme(self, name: str) -> None:
@@ -289,8 +310,9 @@ class App:
     # that touches `self.search_*` state from the results, so nothing
     # here ever has to worry about a render happening mid-mutation.
 
-    def _open_search(self, prefill: str = "") -> None:
+    def _open_search(self, prefill: str = "", mode: str = "track") -> None:
         self.mode = ScreenMode.SEARCH
+        self.search_mode = mode
         self.search_input = prefill
         self.search_results = []
         self.search_cursor = 0
@@ -298,21 +320,31 @@ class App:
         if prefill.strip() and self.config.online.enabled:
             self._start_online_search(prefill.strip())
 
+    def _toggle_search_mode(self) -> None:
+        self.search_mode = "playlist" if self.search_mode == "track" else "track"
+        self.search_results = []
+        self.search_cursor = 0
+        self.search_status = ""
+
     def _start_online_search(self, query: str) -> None:
         if not self.config.online.enabled:
             self.search_status = "Online search is off — enable it in Settings."
             return
-        self.search_status = f"Searching '{query}'…"
+        kind = "playlists" if self.search_mode == "playlist" else "tracks"
+        self.search_status = f"Searching {kind} for '{query}'…"
         self.search_results = []
         self.search_cursor = 0
         generation = self._bump_search_generation()
         threading.Thread(
-            target=self._search_worker, args=(query, generation), daemon=True
+            target=self._search_worker, args=(query, self.search_mode, generation), daemon=True
         ).start()
 
-    def _search_worker(self, query: str, generation: int) -> None:
+    def _search_worker(self, query: str, mode: str, generation: int) -> None:
         try:
-            results = online_source.search(query, limit=self.config.online.search_results)
+            if mode == "playlist":
+                results = online_source.search_playlists(query, limit=self.config.online.search_results)
+            else:
+                results = online_source.search(query, limit=self.config.online.search_results)
             payload = ("ok", results)
         except online_source.OnlineSourceError as exc:
             payload = ("error", str(exc))
@@ -343,11 +375,51 @@ class App:
             if generation == self._search_generation:
                 self._pending_resolve = payload
 
+    # -- online playlist import (search_playlists + resolve_playlist*) ---
+    #
+    # Same background-thread/generation-gate pattern as single-track
+    # search/resolve above, but with a third piece of state
+    # (`_playlist_progress`) since importing a playlist is the one
+    # online-mode operation slow enough that a bare "Loading…" isn't
+    # good enough feedback — see `_playlist_resolve_worker`.
+
+    def _resolve_and_load_playlist(self, result, mode: str) -> None:
+        self.search_status = f"Loading playlist '{result.title}'…"
+        generation = self._bump_search_generation()
+        threading.Thread(
+            target=self._playlist_resolve_worker, args=(result, mode, generation), daemon=True
+        ).start()
+
+    def _playlist_resolve_worker(self, result, mode: str, generation: int) -> None:
+        def on_progress(done: int, total: int) -> None:
+            with self._search_lock:
+                if generation == self._search_generation:
+                    self._playlist_progress = (done, total)
+
+        try:
+            title, entries = online_source.resolve_playlist(
+                result, limit=self.config.online.playlist_track_limit
+            )
+            tracks = online_source.resolve_playlist_bulk(entries, progress_cb=on_progress)
+            if not tracks:
+                raise online_source.OnlineSourceError(
+                    f"Could not resolve any playable tracks from '{title}'"
+                )
+            payload = ("ok", mode, title, tracks)
+        except online_source.OnlineSourceError as exc:
+            payload = ("error", mode, str(exc))
+        with self._search_lock:
+            if generation == self._search_generation:
+                self._pending_playlist_load = payload
+                self._playlist_progress = None
+
     def _bump_search_generation(self) -> int:
         with self._search_lock:
             self._search_generation += 1
             self._pending_search_result = None
             self._pending_resolve = None
+            self._pending_playlist_load = None
+            self._playlist_progress = None
             return self._search_generation
 
     def _cancel_search(self) -> None:
@@ -365,6 +437,9 @@ class App:
             self._pending_search_result = None
             pending_resolve = self._pending_resolve
             self._pending_resolve = None
+            pending_playlist = self._pending_playlist_load
+            self._pending_playlist_load = None
+            playlist_progress = self._playlist_progress
 
         if pending_search is not None:
             kind, payload = pending_search
@@ -387,6 +462,35 @@ class App:
                 self.search_status = f"Added '{track.title}' to queue." if mode == "enqueue" else ""
             else:
                 self.search_status = payload
+
+        if pending_playlist is not None:
+            kind = pending_playlist[0]
+            if kind == "ok":
+                _, mode, title, tracks = pending_playlist
+                # Persist it as a real, browsable playlist (playlist_manager.py
+                # already had save/load_playlist plumbing with nothing wired
+                # up to call it) in addition to whatever we do with the queue.
+                self.playlist.save_playlist(safe_filename(title), tracks)
+                if mode == "play":
+                    # A playlist import replaces the queue outright (like
+                    # the initial library load in main.py) rather than
+                    # inserting after the current track the way a single
+                    # picked search result does — the user asked to load
+                    # and play *this playlist*, not queue it alongside
+                    # whatever was already playing.
+                    self.player.load_queue(tracks)
+                    self.mode = ScreenMode.NORMAL  # jump to now-playing
+                    self.search_status = ""
+                else:
+                    for track in tracks:
+                        self.player.queue.add_end(track)
+                    self.search_status = f"Added {len(tracks)} track(s) from '{title}' to queue."
+            else:
+                _, mode, message = pending_playlist
+                self.search_status = message
+        elif playlist_progress is not None:
+            done, total = playlist_progress
+            self.search_status = f"Loading playlist… ({done}/{total} tracks resolved)"
 
     def _quit(self) -> None:
         self.running = False
@@ -530,22 +634,33 @@ class App:
         UP/DOWN move the selection, Enter plays it, "a" adds it to the
         queue without switching playback, and typing again clears the
         list and starts a fresh query — the same "keep typing to search
-        again" feel as a fuzzy-finder.
+        again" feel as a fuzzy-finder. TAB switches between searching
+        single tracks and whole playlists (see `_toggle_search_mode`).
         """
         if key == "ESC":
             self._cancel_search()
             self.mode = ScreenMode.NORMAL
+        elif key == "TAB":
+            self._toggle_search_mode()
         elif key == "UP" and self.search_results:
             self.search_cursor = max(0, self.search_cursor - 1)
         elif key == "DOWN" and self.search_results:
             self.search_cursor = min(len(self.search_results) - 1, self.search_cursor + 1)
         elif key == "ENTER":
             if self.search_results:
-                self._resolve_and_play_online(self.search_results[self.search_cursor])
+                selected = self.search_results[self.search_cursor]
+                if self.search_mode == "playlist":
+                    self._resolve_and_load_playlist(selected, mode="play")
+                else:
+                    self._resolve_and_play_online(selected)
             elif self.search_input.strip():
                 self._start_online_search(self.search_input.strip())
         elif key == "a" and self.search_results:
-            self._resolve_and_enqueue_online(self.search_results[self.search_cursor])
+            selected = self.search_results[self.search_cursor]
+            if self.search_mode == "playlist":
+                self._resolve_and_load_playlist(selected, mode="enqueue")
+            else:
+                self._resolve_and_enqueue_online(selected)
         elif key == "BACKSPACE":
             if self.search_results:
                 self.search_results = []
@@ -885,9 +1000,10 @@ class App:
         so it's visually obvious the header is now an active input.
         """
         if self.mode == ScreenMode.SEARCH:
+            mode_label = "PLAYLIST" if self.search_mode == "playlist" else "TRACK"
             text = Text.assemble(
                 ("🔍 ", theme.accent),
-                ("Search:  ", f"bold {theme.text_secondary}"),
+                (f"Search [{mode_label}]:  ", f"bold {theme.text_secondary}"),
                 (f"{self.search_input}_", f"bold {theme.accent}"),
             )
             return Panel(text, border_style=theme.accent)
@@ -910,10 +1026,13 @@ class App:
         if self.search_results:
             body = widgets.render_search(
                 self.search_input, self.search_results, self.search_cursor,
-                self.search_status, theme, show_query=False,
+                self.search_status, theme, show_query=False, mode=self.search_mode,
             )
-            heading = "RESULTS"
-            subtitle = "↑/↓ select · Enter play next · a add to queue · type to search again · Esc close"
+            heading = "PLAYLISTS" if self.search_mode == "playlist" else "RESULTS"
+            if self.search_mode == "playlist":
+                subtitle = "↑/↓ select · Enter load & play · a add all to queue · TAB tracks · Esc close"
+            else:
+                subtitle = "↑/↓ select · Enter play next · a add to queue · TAB playlists · Esc close"
         elif self.search_status:
             # Covers several states with one line: "Searching '...'",
             # "Loading '...'", "Added '...' to queue", error text, or
@@ -921,11 +1040,13 @@ class App:
             # text, not necessarily mid-search, hence the generic title.
             body = Text(self.search_status, style=theme.text_secondary)
             heading = "ONLINE SEARCH"
-            subtitle = "Esc close"
+            subtitle = "TAB switch tracks/playlists · Esc close"
         else:
-            body = Text("Type above, then press Enter to search.", style=theme.text_muted)
+            hint = "Type above, then press Enter to search playlists." if self.search_mode == "playlist" \
+                else "Type above, then press Enter to search."
+            body = Text(hint, style=theme.text_muted)
             heading = "ONLINE SEARCH"
-            subtitle = "Esc close"
+            subtitle = "TAB switch tracks/playlists · Esc close"
         group = Group(
             Text(heading, style=f"bold {theme.text_muted}"),
             Text(""),
