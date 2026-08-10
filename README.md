@@ -9,7 +9,7 @@ ever leaving your terminal.
 ![python](https://img.shields.io/badge/python-3.12%2B-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
-![preview](preview.png)
+![preview](preview.jpg)
 
 ## Highlights
 
