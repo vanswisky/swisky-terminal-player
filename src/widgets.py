@@ -248,18 +248,18 @@ def render_control_bar(
     for w in column_widths:
         grid.add_column(justify="center", width=w, no_wrap=True, overflow="crop")
 
-    vol_icon = "󰝟" if muted else "၊၊||၊ "
+    vol_icon = " " if muted else "၊၊||၊ "
     play_icon = "▶" if paused else "⏸"
-    repeat_label = {RepeatMode.OFF: "🗘", RepeatMode.ONE: "🗘 1x", RepeatMode.ALL: "🗘"}[repeat]
+    repeat_label = {RepeatMode.OFF: "󰑗", RepeatMode.ONE: "󰑘", RepeatMode.ALL: "󰑖"}[repeat]
 
     def cell(label: str, active: bool = False) -> Text:
         return Text(label, style=f"bold {theme.accent}" if active else theme.text_secondary, justify="center")
 
     grid.add_row(
         cell(f"{vol_icon}{volume}%"),
-        cell("⏮"),
+        cell("󰼨"),
         cell(play_icon),
-        cell("⏭"),
+        cell("󰼧"),
         cell(repeat_label, active=repeat != RepeatMode.OFF),
         cell(f"", active=shuffle),
         cell(""),
