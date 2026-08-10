@@ -7,27 +7,40 @@ asks `ascii_cache.py` for the current cover's ASCII frame, asks
 `visualizer.py` for the current spectrum, and asks `widgets.py` to
 draw all of it into a `Layout` matching the spec:
 
-    ┌───────────────────────────────────────────┐
-    │                 SEARCH BAR                  │
+    ┌ ⚙ ☰ │ ─────────────────────────────────────┐
+    │       SEARCH BAR (gear + playlists icons)   │
     ├───────────────────┬─────────────────────────┤
-    │                   │  NOW PLAYING / LYRICS    │
-    │   ASCII ALBUM ART │  (enlarged, no dummy     │
-    │                   │   "features" panel)      │
+    │   ASCII ALBUM ART │  NOW PLAYING / LYRICS    │
+    │                   │  (full column height,    │
+    │                   │   no dummy "features"    │
+    │                   │   panel — this is the    │
+    ├───────────────────┤   widest lyrics gets)    │
+    │  SPECTRUM (narrow,│                          │
+    │  under the cover  │                          │
+    │  art only) — only │                          │
+    │  present when ON  │                          │
     ├───────────────────┴─────────────────────────┤
-    │   REALTIME AUDIO SPECTRUM (full width) — only │
-    │   present when the visualizer is turned ON    │
-    ├───────────────────────────────────────────────┤
     │  VOL│PREV│PLAY│NEXT│REPEAT│SHUFFLE│QUEUE│...      │
     └───────────────────────────────────────────────┘
 
-The spectrum row (see `_visualizer_height`) collapses to 0 rows
+The spectrum lives *inside* the art column now — a narrow strip
+directly under the cover, matching the reference layout, rather than
+a full-width row stealing a fixed slice of vertical space from every
+column. That means turning it off/on only changes the art column's
+internal split (see `_art_geometry`'s `vis_h` term), not the height
+available to lyrics — lyrics/now-playing already got the full body
+height either way; this is purely about where the spectrum bars
+themselves are drawn, and matching cover-art width was the reason for
+the earlier full-width design.
+
+The spectrum strip (see `_visualizer_height`) collapses to 0 rows
 whenever `config.visualizer.enabled` is off (toggle with the `v` key
-or from Settings), handing that space back to the album art / now
-playing area so the UI feels bigger with it off rather than leaving
-an empty panel behind. Cover art is re-rendered at the new panel size
-whenever that happens (see the `current_size` cache key in
-`_build_layout`) so the ASCII art's own aspect ratio stays correct
-instead of looking stretched/squashed.
+or from Settings), handing that space back to the album art panel
+itself (it can grow taller) rather than leaving an empty strip
+behind. Cover art is re-rendered at the new panel size whenever that
+happens (see the `current_size` cache key in `_build_layout`) so the
+ASCII art's own aspect ratio stays correct instead of looking
+stretched/squashed.
 
 Screen modes (mutually exclusive overlays): NORMAL, QUEUE, SETTINGS,
 COMMAND_PALETTE, SEARCH. Only one owns keyboard focus at a time.
@@ -70,9 +83,12 @@ logger = logging.getLogger(__name__)
 # Must match the column order produced by widgets.render_control_bar exactly.
 # ("seek" was removed — clicking it never did anything; the progress bar
 # itself is the click-to-seek control, handled separately below.)
+# ("settings" moved out to the header, top-left next to the search bar —
+# see `_render_header`/`_handle_mouse` — alongside the new "playlists"
+# button that lives there too, so this bar is one shorter than before.)
 CONTROL_BAR_SEGMENTS = (
     "volume", "previous", "play_pause", "next",
-    "repeat", "shuffle", "queue", "settings", "exit",
+    "repeat", "shuffle", "queue", "exit",
 )
 
 # Horizontal chrome the control bar's Panel consumes before its content
@@ -97,6 +113,7 @@ _ART_CHROME_H = 2
 class ScreenMode(enum.Enum):
     NORMAL = enum.auto()
     QUEUE = enum.auto()
+    PLAYLISTS = enum.auto()
     SETTINGS = enum.auto()
     COMMAND_PALETTE = enum.auto()
     SEARCH = enum.auto()
@@ -109,7 +126,13 @@ class App:
     # with each other is exactly what broke mouse seeking and ASCII
     # art scaling before.
     HEADER_H = 3
-    VISUALIZER_H = 10
+    # Bar-row count for the spectrum strip. Used to be 10 rows for a
+    # full-width row across the *entire* terminal; now that it's a
+    # narrow strip confined to the art column's own width (see
+    # `_build_layout`), that many rows would look absurdly tall and
+    # thin for how few columns it spans — 6 keeps it proportionate,
+    # roughly matching the reference layout's cover:spectrum ratio.
+    VISUALIZER_H = 3
     CONTROLS_H = 3
 
     def __init__(
@@ -142,6 +165,18 @@ class App:
         self.queue_scroll = 0
         self.queue_visible_rows = 12
         self.settings_cursor = 0
+        # Saved-playlist browser (ScreenMode.PLAYLISTS) — distinct from
+        # the QUEUE screen above, which shows the *current* play queue.
+        # `_saved_playlists`/`_saved_playlist_counts` are a snapshot
+        # taken when the screen opens (`_open_playlists`), not
+        # recomputed every frame — this is disk I/O (see
+        # `PlaylistManager.list_saved_playlists`/`count_saved_playlist`)
+        # and the list only actually changes from inside this screen
+        # (delete) or from a completed online-playlist import, both of
+        # which already know to refresh it explicitly.
+        self.playlists_cursor = 0
+        self._saved_playlists: list[str] = []
+        self._saved_playlist_counts: dict[str, int] = {}
         self._last_cover: str | None = None
         # (width, height, visualizer_enabled) snapshot — see the note
         # near `_last_art_size`'s assignment below for why the third
@@ -189,6 +224,17 @@ class App:
         self._progress_row: int | None = None
         self._progress_cols: tuple[int, int] | None = None
         self._control_row: int | None = None
+        # Header (top bar: settings gear, playlists list icon, search
+        # bar) hit regions — only meaningful while the header is
+        # actually drawn, i.e. NORMAL/SEARCH mode (see `_build_overlay`
+        # — every other mode replaces the whole screen, header
+        # included). `None` while not applicable, same pattern as
+        # `_control_row` above, so a stray click can't fire against
+        # stale coordinates from a different screen.
+        self._header_row: int | None = None
+        self._header_gear_cols: tuple[int, int] | None = None
+        self._header_playlists_cols: tuple[int, int] | None = None
+        self._header_search_cols: tuple[int, int] | None = None
 
         self.command_palette = CommandPalette()
         self._register_commands()
@@ -232,7 +278,8 @@ class App:
                     lambda m: self.lyrics.reload())
         cp.register(r"^scan library$", "scan library — rescan music folders",
                     lambda m: self._rescan_library())
-        cp.register(r"^playlist$", "playlist — open playlist browser", lambda m: self._set_mode(ScreenMode.QUEUE))
+        cp.register(r"^playlist$", "playlist — open saved playlists", lambda m: self._open_playlists())
+        cp.register(r"^playlists$", "playlists — open saved playlists", lambda m: self._open_playlists())
         cp.register(r"^queue$", "queue — open queue view", lambda m: self._set_mode(ScreenMode.QUEUE))
         # Registered before the plain "online QUERY" pattern below —
         # CommandPalette.execute matches patterns in registration order
@@ -284,6 +331,22 @@ class App:
             self.queue_cursor = max(0, self.player.queue.cursor)
             self._sync_queue_scroll()
         self.mode = mode
+
+    def _open_playlists(self) -> None:
+        """Opens the saved-playlist browser, taking a fresh snapshot
+        of what's on disk first — `self.playlist` (PlaylistManager)
+        doesn't keep a live in-memory index of every save, so this is
+        the point that actually goes and lists `PLAYLISTS_DIR`.
+        """
+        self._refresh_saved_playlists()
+        self.playlists_cursor = min(self.playlists_cursor, max(0, len(self._saved_playlists) - 1))
+        self.mode = ScreenMode.PLAYLISTS
+
+    def _refresh_saved_playlists(self) -> None:
+        self._saved_playlists = self.playlist.list_saved_playlists()
+        self._saved_playlist_counts = {
+            name: self.playlist.count_saved_playlist(name) for name in self._saved_playlists
+        }
 
     def _sync_queue_scroll(self) -> None:
         """Keeps `queue_scroll` in a window that contains `queue_cursor`.
@@ -471,6 +534,8 @@ class App:
                 # already had save/load_playlist plumbing with nothing wired
                 # up to call it) in addition to whatever we do with the queue.
                 self.playlist.save_playlist(safe_filename(title), tracks)
+                if self.mode == ScreenMode.PLAYLISTS:
+                    self._refresh_saved_playlists()
                 if mode == "play":
                     # A playlist import replaces the queue outright (like
                     # the initial library load in main.py) rather than
@@ -532,6 +597,8 @@ class App:
                 self._handle_palette_key(key)
             elif self.mode == ScreenMode.QUEUE:
                 self._handle_queue_key(key)
+            elif self.mode == ScreenMode.PLAYLISTS:
+                self._handle_playlists_key(key)
             elif self.mode == ScreenMode.SETTINGS:
                 self._handle_settings_key(key)
             elif self.mode == ScreenMode.SEARCH:
@@ -575,6 +642,8 @@ class App:
             cfg.visualizer.enabled = not cfg.visualizer.enabled
         elif key == "o":
             self._open_search()
+        elif key == "P":
+            self._open_playlists()
         elif key == "f":
             pass  # fullscreen is inherent to `Live(screen=True)`
         elif key == "CTRL_P":
@@ -626,6 +695,40 @@ class App:
             self.player.queue.remove(self.queue_cursor)
             self.queue_cursor = min(self.queue_cursor, max(0, len(self.player.queue.items) - 1))
             self._sync_queue_scroll()
+
+    def _handle_playlists_key(self, key: str) -> None:
+        """UP/DOWN select, Enter loads the playlist and replaces the
+        queue with it (same "this becomes what's playing" semantics
+        `_finish_playlist_import`'s "play" mode uses for a freshly
+        imported online playlist — consistent behaviour whether the
+        playlist just came from search or was saved earlier), 'a'
+        appends it to the end of the current queue instead without
+        interrupting playback, 'd'/Backspace deletes the save (with
+        the list re-fetched from disk afterward so a deleted name
+        can't linger selectable), Esc closes.
+        """
+        names = self._saved_playlists
+        if key == "ESC":
+            self.mode = ScreenMode.NORMAL
+        elif key == "UP":
+            self.playlists_cursor = max(0, self.playlists_cursor - 1)
+        elif key == "DOWN":
+            self.playlists_cursor = min(max(0, len(names) - 1), self.playlists_cursor + 1)
+        elif key == "ENTER" and names:
+            name = names[self.playlists_cursor]
+            tracks = self.playlist.load_playlist(name)
+            if tracks:
+                self.player.load_queue(tracks)
+                self.mode = ScreenMode.NORMAL
+        elif key == "a" and names:
+            name = names[self.playlists_cursor]
+            for track in self.playlist.load_playlist(name):
+                self.player.queue.add_end(track)
+        elif (key == "d" or key == "BACKSPACE") and names:
+            name = names[self.playlists_cursor]
+            self.playlist.delete_playlist(name)
+            self._refresh_saved_playlists()
+            self.playlists_cursor = min(self.playlists_cursor, max(0, len(self._saved_playlists) - 1))
 
     def _handle_search_key(self, key: str) -> None:
         """Text input and results browsing share one screen and one key
@@ -744,6 +847,25 @@ class App:
                 self.player.seek_to_fraction(fraction)
                 return
 
+        # Header buttons (settings gear, playlists list icon, and the
+        # search bar itself). Only live in NORMAL/SEARCH — every other
+        # mode replaces the whole screen via `_build_overlay`, header
+        # included, so there's nothing there to click (same gating
+        # `_control_row` below uses, for the same reason).
+        if self.mode in (ScreenMode.NORMAL, ScreenMode.SEARCH) and self._header_row is not None \
+                and event.row == self._header_row:
+            if self._header_gear_cols and self._header_gear_cols[0] <= event.column <= self._header_gear_cols[1]:
+                self._set_mode(ScreenMode.SETTINGS)
+                return
+            if self._header_playlists_cols and \
+                    self._header_playlists_cols[0] <= event.column <= self._header_playlists_cols[1]:
+                self._open_playlists()
+                return
+            if self.mode == ScreenMode.NORMAL and self._header_search_cols and \
+                    self._header_search_cols[0] <= event.column <= self._header_search_cols[1]:
+                self._open_search()
+                return
+
         # Control bar buttons. Still live during SEARCH — the control
         # bar stays visible there (see `_build_layout`) so playback of
         # whatever's already playing can keep being controlled while
@@ -793,7 +915,6 @@ class App:
             "repeat": lambda: self.player.cycle_repeat(),
             "shuffle": lambda: self.player.toggle_shuffle(),
             "queue": lambda: self._set_mode(ScreenMode.QUEUE),
-            "settings": lambda: self._set_mode(ScreenMode.SETTINGS),
             "exit": lambda: self._quit(),
         }
         action = actions.get(segment)
@@ -803,28 +924,37 @@ class App:
     # -- layout building -----------------------------------------------
 
     def _visualizer_height(self) -> int:
-        """Effective row-height of the spectrum region: `VISUALIZER_H`
-        while the visualizer is on, or 0 while it's off. Collapsing to
-        0 (rather than just leaving it blank) is what actually hands
-        those rows back to the art/info area above it — `layout["body"]`
-        has `ratio=1` so it expands to fill whatever the visualizer
-        region doesn't take.
+        """Row-height of the spectrum strip *inside the art column*:
+        `VISUALIZER_H` while the visualizer is on, or 0 while it's
+        off. Collapsing to 0 (rather than just leaving it blank) is
+        what actually hands those rows back to the cover art panel
+        above it within the same column — see the `size=0` Rich
+        gotcha noted below `_build_layout`'s `rows = [...]`, which
+        applies here too (that's why the art column's internal split
+        is skipped entirely, not sized to 0, when the visualizer is
+        off).
         """
         return self.VISUALIZER_H if self.config.visualizer.enabled else 0
 
     def _body_height(self) -> int:
         """Rows available to the `body` row (art + info) once the fixed
-        header/visualizer/controls regions are subtracted. This is the
-        same number `Layout`'s `ratio=1` resolves `body` to internally
-        — but a `rich.panel.Panel` does NOT auto-stretch to match its
+        header/controls regions are subtracted. This is the same
+        number `Layout`'s `ratio=1` resolves `body` to internally —
+        but a `rich.panel.Panel` does NOT auto-stretch to match its
         `Layout` region (it sizes to its own content and leaves the
         rest of the region unpainted), so the cover art panel needs
         this number handed to it explicitly (`height=`) to actually
         reach all the way down instead of floating as a short box with
         dead, transparent-looking space underneath it.
+
+        The spectrum strip is no longer a sibling of `body` — it lives
+        *inside* the art column (see `_build_layout`) — so unlike the
+        old full-width design, this total does NOT change depending on
+        whether the visualizer is on; only how the art column divides
+        its own share of it changes (`_art_geometry` handles that).
         """
         console_h = self.console.size.height
-        return max(1, console_h - (self.HEADER_H + self._visualizer_height() + self.CONTROLS_H))
+        return max(1, console_h - (self.HEADER_H + self.CONTROLS_H))
 
     def _build_layout(self) -> Layout:
         theme = self.theme_mgr.current
@@ -870,39 +1000,58 @@ class App:
             self._art_panel_size = (panel_w, panel_h)
             self._last_art_size = current_size
 
-        # NOTE: rich.layout's fixed-size resolver treats `size=0` as
-        # falsy and silently falls back to ratio-based sizing for that
-        # row (`_ratio.py` does `edge.size or None`) — passing
-        # `size=self._visualizer_height()` here when it's 0 doesn't
-        # "collapse" the visualizer row at all, it makes Rich split the
-        # remaining height 50/50 between "body" and "visualizer" (both
-        # end up ratio=1), which is exactly what was cutting the cover
-        # art / lyrics panel roughly in half whenever the visualizer was
-        # turned off. The only reliable way to actually zero out a row
-        # is to not create it in the first place.
+        # No top-level "visualizer" row anymore — the spectrum now lives
+        # *inside* the art column (see the class docstring's layout
+        # diagram), so `body` is always exactly header/controls-minus
+        # tall regardless of whether the visualizer is on. The
+        # `size=0`-is-falsy Rich gotcha the old comment here warned
+        # about (`_ratio.py` does `edge.size or None`, so a literal 0
+        # silently falls back to ratio-based 50/50 splitting instead of
+        # collapsing) still applies to the *inner* `art` column split
+        # below — same fix, just one level deeper: don't create the
+        # `art_visualizer` sub-row at all when it should be 0-height,
+        # rather than passing `size=0`.
         visualizer_enabled = self.config.visualizer.enabled
-        rows = [
+        layout = Layout()
+        layout.split_column(
             Layout(name="header", size=self.HEADER_H),
             Layout(name="body", ratio=1),
-        ]
-        if visualizer_enabled:
-            rows.append(Layout(name="visualizer", size=self.VISUALIZER_H))
-        rows.append(Layout(name="controls", size=self.CONTROLS_H))
-
-        layout = Layout()
-        layout.split_column(*rows)
+            Layout(name="controls", size=self.CONTROLS_H),
+        )
         layout["body"].split_row(
             Layout(name="art", ratio=1),
             Layout(name="info", ratio=2),
         )
+        if visualizer_enabled:
+            layout["art"].split_column(
+                Layout(name="art_cover", ratio=1),
+                Layout(name="art_visualizer", size=self.VISUALIZER_H),
+            )
+        # else: "art" stays a single region — nothing to split, the
+        # cover panel gets the whole column (same "don't create a
+        # size=0 row" reasoning as the old top-level version had).
 
         layout["header"].update(self._render_header(theme))
         panel_w, panel_h = self._art_panel_size or (max(10, _ART_CHROME_W), max(5, _ART_CHROME_H))
-        layout["art"].update(
+        art_target = layout["art"]["art_cover"] if visualizer_enabled else layout["art"]
+        # `art_cover`'s own region is `body_h - VISUALIZER_H` tall, but the
+        # panel itself (`panel_h`) is only ever that tall or *shorter* —
+        # `_art_geometry` derives height from the cover's own aspect ratio,
+        # not the full region, so a portrait/square cover in a width-capped
+        # column leaves leftover rows inside `art_cover`. Centering
+        # (`vertical="middle"`) split that leftover evenly above *and*
+        # below the box, which pushed the spectrum strip further from the
+        # cover than necessary. Anchoring to the bottom instead puts all
+        # the leftover room above the box and lets it sit flush against
+        # the spectrum strip immediately below — same idea only applies
+        # when the strip is actually there; with it off, "art" is the
+        # whole column and middle-centering still looks best.
+        art_vertical = "bottom" if visualizer_enabled else "middle"
+        art_target.update(
             Align(
                 widgets.render_ascii_art(self._ascii_frame, theme, width=panel_w, height=panel_h),
                 align="center",
-                vertical="middle",
+                vertical=art_vertical,
             )
         )
 
@@ -936,11 +1085,25 @@ class App:
 
         if visualizer_enabled:
             spec_frame = self.spectrum.decay() if state.paused else self.spectrum.analyze_at(state.position)
-            vis_width = max(10, self.console.size.width - 4)
-            layout["visualizer"].update(widgets.render_visualizer(spec_frame, theme, vis_width, height=8))
-        # else: the row simply doesn't exist in this frame's layout (see
-        # the note above `rows = [...]`) — nothing to update, and "body"
-        # already absorbed the freed-up height via its ratio=1 split.
+            # Match the cover panel's own rendered width (minus a
+            # hair of margin) rather than the old full-terminal-width
+            # bar count — the strip now sits directly under the art,
+            # not spanning the whole screen, so it should visually
+            # line up with the box above it (see the reference layout
+            # in the class docstring).
+            vis_width = max(5, panel_w - 2)
+            layout["art"]["art_visualizer"].update(
+                Align(
+                    widgets.render_visualizer(
+                        spec_frame, theme, vis_width, height=self.VISUALIZER_H, bordered=False,
+                    ),
+                    align="center",
+                )
+            )
+        # else: the sub-row simply doesn't exist in this frame's art
+        # column (see the note above the `art`/`art_visualizer` split)
+        # — nothing to update, and the cover panel already absorbed the
+        # freed-up height via `art_target`/`_art_geometry` above.
 
         _, control_bar_widths = self._control_bar_geometry()
         layout["controls"].update(
@@ -991,27 +1154,68 @@ class App:
         return layout
 
     def _render_header(self, theme) -> Panel:
-        """The header is a search bar, always. While `SEARCH` mode is
-        open this 3-row strip is the live query input; otherwise it's
-        an idle placeholder hinting at the 'o' shortcut that opens it.
-        The old static "Swisky~" wordmark panel was removed in favor
-        of this so the header stays a functional control instead of
-        just branding. Border color switches to accent while typing
-        so it's visually obvious the header is now an active input.
+        """The header is a search bar, always — now with two icon
+        buttons to its left: a settings gear (moved here from the
+        control bar) and a playlists list icon (brand new — there was
+        previously no way at all to open the saved-playlist browser;
+        see `ScreenMode.PLAYLISTS`). While `SEARCH` mode is open this
+        3-row strip is the live query input; otherwise it's an idle
+        placeholder hinting at the 'o'/'P' shortcuts. Border color
+        switches to accent while typing so it's visually obvious the
+        header is now an active input.
+
+        Also computes `self._header_row`/`_header_gear_cols`/
+        `_header_playlists_cols`/`_header_search_cols` — the mouse
+        hit-test zones `_handle_mouse` checks against — so the icons
+        drawn here and the click zones that activate them can never
+        drift out of sync (same reasoning as `_control_bar_geometry`'s
+        docstring). The zone widths below are sized to the *exact*
+        character counts of the `icons` text assembled a few lines
+        down, not a shared guess-width constant — an earlier version
+        used one arbitrary width for both icons, which didn't actually
+        match "⚙" + a 2-char gap vs "☰" + a 6-char gap/divider, so the
+        playlists zone started one column past where "☰" is actually
+        drawn: clicking directly on the visible playlist icon landed in
+        the gear zone instead and opened Settings.
         """
+        content_left = _PANEL_CONTENT_LEFT
+        self._header_row = 2  # header is always the first Layout row: row 1 = top border, row 2 = content
+
+        # Matches the "icons" Text.assemble below character-for-character:
+        # "⚙" + "  " = 3 cols, then "☰" + "   │  " = 7 cols, then search
+        # content starts. Keep these two widths in sync with that Text if
+        # it's ever restyled.
+        GEAR_W = 3
+        PLAYLISTS_W = 7
+        self._header_gear_cols = (content_left, content_left + GEAR_W - 1)
+        self._header_playlists_cols = (
+            content_left + GEAR_W, content_left + GEAR_W + PLAYLISTS_W - 1,
+        )
+        search_start = content_left + GEAR_W + PLAYLISTS_W
+
+        icons = Text.assemble(
+            ("", theme.text_secondary), ("  ", ""),
+            ("", theme.text_secondary), ("   │  ", theme.border),
+        )
+
         if self.mode == ScreenMode.SEARCH:
             mode_label = "PLAYLIST" if self.search_mode == "playlist" else "TRACK"
             text = Text.assemble(
-                ("🔍 ", theme.accent),
+                icons,
+                ("✨ ", theme.accent),
                 (f"Search [{mode_label}]:  ", f"bold {theme.text_secondary}"),
                 (f"{self.search_input}_", f"bold {theme.accent}"),
             )
+            self._header_search_cols = (search_start, max(search_start, self.console.size.width - 3))
             return Panel(text, border_style=theme.accent)
+
         text = Text.assemble(
-            ("🔍 ", theme.text_muted),
+            icons,
+            ("✨ ", theme.text_muted),
             ("Search for a track or artist…", theme.text_muted),
-            ("  (press 'o')", theme.text_muted),
+            ("  ('o' search · 'P' playlists)", theme.text_muted),
         )
+        self._header_search_cols = (search_start, max(search_start, self.console.size.width - 3))
         return Panel(text, border_style=theme.border)
 
     def _render_search_results_panel(self, theme):
@@ -1074,6 +1278,16 @@ class App:
             return Panel(body, title="QUEUE", subtitle="↑/↓ move · Enter play · d remove · Esc close",
                          border_style=theme.accent)
 
+        if self.mode == ScreenMode.PLAYLISTS:
+            body = widgets.render_playlists(
+                self._saved_playlists, self.playlists_cursor, self._saved_playlist_counts, theme,
+            )
+            return Panel(
+                body, title="PLAYLISTS",
+                subtitle="↑/↓ select · Enter load & play · a add to queue · d delete · Esc close",
+                border_style=theme.accent,
+            )
+
         if self.mode == ScreenMode.SETTINGS:
             body = widgets.render_settings(self.config, theme, cursor=self.settings_cursor)
             return Panel(body, title="SETTINGS", subtitle="↑/↓ select · ←/→ change · Esc to close and save",
@@ -1086,15 +1300,18 @@ class App:
 
         Width is derived only from console width — this column always
         gets 1/3 of it, border+padding included — never from `body_h`.
-        `body_h` (rows left for the body row) swings a lot depending on
-        whether the visualizer row exists this frame (10 rows vs. none
-        at all — see the `size=0` Rich gotcha noted in `_build_layout`),
-        and forcing the panel's own height to always equal `body_h`
-        used to stretch the box into a tall, "lonjong" (elongated)
-        rectangle whenever the visualizer was off and squash it back
-        "gepeng" (flattened) whenever it was on — the box's *shape*
-        changed on every toggle even though the artwork itself never
-        did.
+        `body_h` (rows left for the body row) is stable regardless of
+        the visualizer toggle now — the spectrum strip lives *inside*
+        the art column instead of as a sibling row (see `_build_layout`'s
+        class-docstring diagram) — but the cover panel's own *share* of
+        that column still swings by `VISUALIZER_H` rows depending on
+        whether the strip is present this frame (`vis_h` below), for
+        the same reason the old top-level version did: forcing the
+        panel's own height to always equal the full column would
+        stretch the box into a tall, "lonjong" (elongated) rectangle
+        whenever the visualizer was off and squash it back "gepeng"
+        (flattened) whenever it was on — the box's *shape* changed on
+        every toggle even though the artwork itself never did.
 
         Height instead comes from the cover's own aspect ratio and the
         terminal's ~2:1 character-cell aspect (the exact same formula
@@ -1119,9 +1336,13 @@ class App:
         console_w = self.console.size.width
         art_panel_w = max(10, console_w // 3)
         body_h = self._body_height()
+        vis_h = self._visualizer_height()  # 0 when the visualizer is off
 
         max_cols = max(10, art_panel_w - _ART_CHROME_W)
-        max_rows = max(5, body_h - _ART_CHROME_H)
+        # Reserve the spectrum strip's rows out of the art column's own
+        # share before sizing the cover panel — see the docstring above
+        # for why this can't just always equal `body_h`.
+        max_rows = max(5, body_h - _ART_CHROME_H - vis_h)
 
         aspect = 1.0
         if cover_path:

@@ -152,19 +152,41 @@ def render_lyrics(state: LyricsState, position: float, theme: Theme, context: in
 # Spectrum visualizer (full width bar)
 # --------------------------------------------------------------------------
 
-def render_visualizer(frame: SpectrumFrame | None, theme: Theme, width: int, height: int = 8) -> Panel:
+def render_visualizer(
+    frame: SpectrumFrame | None, theme: Theme, width: int, height: int = 8,
+    bordered: bool = True,
+) -> Panel | Group:
+    """cava-style: skinny 1-column bars with a 1-column gap between
+    each one (cava's default look — distinct bars, not a solid packed
+    block), instead of the old edge-to-edge fill. Each bar still uses
+    `VISUALIZER_BARS_RAMP`'s eighths-block glyphs for its topmost,
+    partially-filled row, same sub-cell precision as before — only the
+    spacing changed.
+
+    `bordered=True` (the original full-width placement, kept for any
+    future/legacy caller) wraps the bars in a titled Panel. `ui.py` now
+    places this compactly under the cover art instead, where a border
+    and title would eat rows that matter more as bar height on a small
+    strip — `bordered=False` returns just the bar rows as a bare Group,
+    letting the caller control padding/alignment itself.
+    """
     if frame is None or width <= 0:
         body = Text("")
     else:
         bands = frame.bands
+        # One gap column between bars eats into how many actually fit —
+        # `bar_count` bars plus `bar_count - 1` single-space gaps must
+        # still fit in `width`.
+        bar_count = max(1, (width + 1) // 2)
         n = len(bands)
-        # Resample band count to available width so the visualizer always
-        # spans the full terminal width regardless of band_count setting.
-        if n != width and n > 0:
-            xs = [int(i * n / width) for i in range(width)]
+        # Resample band count to how many bars actually fit so the
+        # visualizer always spans the available width regardless of the
+        # band_count setting.
+        if n != bar_count and n > 0:
+            xs = [int(i * n / bar_count) for i in range(bar_count)]
             values = [bands[i] for i in xs]
         else:
-            values = list(bands)
+            values = list(bands[:bar_count])
 
         ramp = VISUALIZER_BARS_RAMP
         rows = []
@@ -179,9 +201,11 @@ def render_visualizer(frame: SpectrumFrame | None, theme: Theme, width: int, hei
                     chars.append(ramp[max(1, idx)])
                 else:
                     chars.append(" ")
-            rows.append(Text("".join(chars), style=theme.accent))
+            rows.append(Text(" ".join(chars), style=theme.accent))
         body = Group(*rows)
 
+    if not bordered:
+        return body
     return Panel(body, title="REALTIME AUDIO SPECTRUM", title_align="left",
                  border_style=theme.border, style=theme.background)
 
@@ -199,8 +223,17 @@ def render_control_bar(
     muted: bool,
     column_widths: list[int],
 ) -> Table:
-    """9 segments matching the spec layout:
-    VOL | PREV | PLAY | NEXT | REPEAT | SHUFFLE | QUEUE | SETTINGS | EXIT
+    """8 segments matching the spec layout:
+    VOL | PREV | PLAY | NEXT | REPEAT | SHUFFLE | QUEUE | EXIT
+
+    SETTINGS moved out of this bar and into the header (top-left,
+    next to the search bar — see `ui.py::_render_header`); still
+    reachable the same three ways it always was (click, `Esc`, or the
+    `settings` idea generally) — this row just doesn't carry the
+    button anymore. PLAYLISTS (saved playlists — distinct from QUEUE,
+    the *current* play queue) lives in the header too, as a brand new
+    button next to it — there was no way at all to reach the saved
+    playlist browser before.
 
     `column_widths` gives each column's exact rendered width in
     characters, computed once by `ui.py::_control_bar_geometry` and
@@ -215,7 +248,7 @@ def render_control_bar(
     for w in column_widths:
         grid.add_column(justify="center", width=w, no_wrap=True, overflow="crop")
 
-    vol_icon = "🔇" if muted else "၊၊||၊ "
+    vol_icon = "󰝟" if muted else "၊၊||၊ "
     play_icon = "▶" if paused else "⏸"
     repeat_label = {RepeatMode.OFF: "🗘", RepeatMode.ONE: "🗘 1x", RepeatMode.ALL: "🗘"}[repeat]
 
@@ -228,10 +261,9 @@ def render_control_bar(
         cell(play_icon),
         cell("⏭"),
         cell(repeat_label, active=repeat != RepeatMode.OFF),
-        cell(f"⇆", active=shuffle),
-        cell("QUEUE ☰"),
-        cell("SETTINGS ⚙"),
-        cell("EXIT ✕"),
+        cell(f"", active=shuffle),
+        cell(""),
+        cell("➜]"),
     )
     return grid
 
@@ -281,6 +313,46 @@ def render_queue(
             Text(track.title, style=style),
             Text(track.artist, style=style),
             Text(format_time(track.duration), style=style),
+            style=row_style,
+        )
+    return table
+
+
+def render_playlists(
+    names: list[str],
+    selected: int,
+    counts: dict[str, int],
+    theme: Theme,
+) -> Table:
+    """The saved-playlist browser (`ScreenMode.PLAYLISTS` — distinct
+    from `render_queue` above, which shows the *current* play queue).
+    One row per playlist saved via `playlist_manager.save_playlist`
+    (manually, or automatically when importing an online playlist —
+    see `ui.py::_finish_playlist_import`), with track count so an
+    empty/broken save is obvious before loading it.
+
+    `counts` maps playlist name -> track count, precomputed by
+    `ui.py` (it already has the `PlaylistManager` and doesn't need
+    this widget re-touching disk on every frame).
+    """
+    table = Table(expand=True, border_style=theme.border, header_style=f"bold {theme.text_muted}")
+    table.add_column("#", width=4)
+    table.add_column("Playlist")
+    table.add_column("Tracks", width=8, justify="right")
+
+    if not names:
+        table.add_row(Text(""), Text("No saved playlists yet.", style=theme.text_muted), Text(""))
+        return table
+
+    for i, name in enumerate(names):
+        is_selected = i == selected
+        style = f"bold {theme.accent}" if is_selected else theme.text_secondary
+        marker = "▶" if is_selected else str(i + 1)
+        row_style = f"on {theme.surface}" if is_selected else None
+        table.add_row(
+            Text(marker, style=style),
+            Text(name, style=style, overflow="ellipsis"),
+            Text(str(counts.get(name, 0)), style=style),
             style=row_style,
         )
     return table

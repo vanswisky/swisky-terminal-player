@@ -278,11 +278,23 @@ class SpectrumAnalyzer:
                 self._fft_bands(right[start:end], sr) if self.config.stereo else target_bands
             )
 
-        alpha = 1.0 - self.config.smoothing
-        self._smoothed = self._smoothed * self.config.smoothing + target_bands * alpha
-        self._smoothed_right = (
-            self._smoothed_right * self.config.smoothing + target_right * alpha
-        )
+        target_bands = self._spatial_smooth(target_bands)
+        target_right = self._spatial_smooth(target_right) if self.config.stereo else target_right
+
+        # Asymmetric attack/release rather than one shared coefficient:
+        # blending toward the target at the same rate whether it's rising
+        # or falling is what made bars look flat/mechanical — a bar
+        # catching a kick drum eased up exactly as sluggishly as a bar
+        # fading out afterward, so nothing ever looked "hit". Real cava
+        # (and every other bar-style analyzer) snaps up fast on a
+        # transient and drifts back down slowly under gravity.
+        # `config.smoothing` keeps meaning what it always did — the fall
+        # rate — attack is just fixed faster than that so a rise never
+        # lags behind the beat that caused it.
+        release = self.config.smoothing
+        attack = min(release, 0.35)
+        self._smoothed = self._ema_step(self._smoothed, target_bands, attack, release)
+        self._smoothed_right = self._ema_step(self._smoothed_right, target_right, attack, release)
 
         self._peaks = np.maximum(self._peaks * 0.94, self._smoothed)
 
@@ -315,6 +327,41 @@ class SpectrumAnalyzer:
             peaks=self._peaks.copy(),
             bands_right=self._smoothed_right.copy() if self.config.stereo else None,
         )
+
+    @staticmethod
+    def _ema_step(current: np.ndarray, target: np.ndarray, attack: float, release: float) -> np.ndarray:
+        """Per-band exponential blend toward `target`, using `attack` for
+        bands that are rising and `release` for bands that are falling —
+        see the call site for why a single shared coefficient looked
+        stiff. `coeff` is the *retained* fraction of `current` (same
+        convention the old single-rate blend used), so higher = slower.
+        """
+        rising = target > current
+        coeff = np.where(rising, attack, release)
+        return current * coeff + target * (1.0 - coeff)
+
+    @staticmethod
+    def _spatial_smooth(values: np.ndarray) -> np.ndarray:
+        """Blend each band a little with its immediate left/right
+        neighbors (a light version of cava's own "monstercat" smoothing).
+        Without this, adjacent bars are statistically independent — each
+        one jitters on its own from frame to frame — which reads as
+        jagged/robotic noise rather than one continuous, natural-looking
+        spectrum shape. The kernel is deliberately gentle (60/20/20) so
+        real peaks (kick vs. snare in different bands) don't blur into
+        each other, just lose their single-frame jaggedness.
+        """
+        if len(values) < 3:
+            return values
+        left = np.roll(values, 1)
+        right = np.roll(values, -1)
+        # Edge bands have no real neighbor on one side — roll wraps
+        # around, which would leak the opposite edge's energy in;
+        # clamp those to the edge value itself instead (equivalent to
+        # not smoothing across the boundary).
+        left[0] = values[0]
+        right[-1] = values[-1]
+        return values * 0.6 + left * 0.2 + right * 0.2
 
     def _fft_bands(self, chunk: np.ndarray, sr: int) -> np.ndarray:
         n = len(chunk)
