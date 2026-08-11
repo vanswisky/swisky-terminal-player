@@ -270,6 +270,8 @@ The interface uses patched Private Use Area glyphs from Font Awesome, Codicons /
 
 ```bash
 git clone https://github.com/vanswisky/swisky-terminal-player.git
+```
+```bash
 cd swisky-terminal-player
 python3 -m venv .venv
 source .venv/bin/activate
