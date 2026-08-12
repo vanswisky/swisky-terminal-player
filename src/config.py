@@ -76,6 +76,12 @@ class PlaybackConfig:
     volume_step: int = 5
     repeat: RepeatMode = RepeatMode.OFF
     shuffle: bool = False
+    # "Radio" / autoplay: keeps topping the queue up with fresh tracks
+    # pulled from the full library (see radio.py) once it runs low,
+    # instead of stopping at the end of whatever was originally
+    # queued. Independent of `shuffle` — YT Music's Radio behaves the
+    # same whether shuffle is toggled or not.
+    radio: bool = False
 
 
 @dataclass(slots=True)
@@ -158,6 +164,7 @@ class AppConfig:
             volume_step=p.get("volume_step", cfg.playback.volume_step),
             repeat=RepeatMode(p.get("repeat", cfg.playback.repeat.value)),
             shuffle=p.get("shuffle", cfg.playback.shuffle),
+            radio=p.get("radio", cfg.playback.radio),
         )
 
         l = d.get("lyrics", {})

@@ -266,6 +266,8 @@ class App:
                     lambda m: setattr(self.config.playback, "repeat", RepeatMode(m.group(1))))
         cp.register(r"^shuffle (on|off)$", "shuffle on|off",
                     lambda m: setattr(self.config.playback, "shuffle", m.group(1) == "on"))
+        cp.register(r"^radio (on|off)$", "radio on|off — auto-fill queue from your library",
+                    lambda m: setattr(self.config.playback, "radio", m.group(1) == "on"))
         cp.register(r"^theme (\w+)$", "theme NAME — switch color theme",
                     lambda m: self._set_theme(m.group(1)))
         cp.register(r"^ascii (classic|block|braille)$", "ascii MODE — switch ASCII renderer",
@@ -630,6 +632,8 @@ class App:
             self.player.cycle_repeat()
         elif key == "s":
             self.player.toggle_shuffle()
+        elif key == "R":
+            self.player.toggle_radio()
         elif key == "l":
             cfg.lyrics.enabled = not cfg.lyrics.enabled
         elif key == "a":
@@ -1111,6 +1115,7 @@ class App:
                 widgets.render_control_bar(
                     theme, state.volume, state.paused, self.config.playback.repeat,
                     self.config.playback.shuffle, self.player.muted, control_bar_widths,
+                    radio=self.config.playback.radio,
                 ),
                 border_style=theme.border,
             )

@@ -203,6 +203,16 @@ class AudioEngine:
         self._mpv.stop()
         with self._lock:
             self._state.position = 0.0
+            # Without this, `stop()` (queue genuinely ran out, no
+            # repeat/radio to fall back on) left `paused` at whatever
+            # it was mid-playback — usually False. The UI reads
+            # `state.paused` to decide "still playing" vs "stopped"
+            # (transport icon, spectrum decay-vs-analyze in ui.py), so
+            # it kept rendering as if a track were actively playing
+            # against a dead mpv instance: no error, no advance, just
+            # a frozen-looking screen. Marking paused here makes the
+            # UI reflect reality the same frame playback actually ends.
+            self._state.paused = True
 
     def seek(self, seconds: float, relative: bool = True) -> None:
         try:

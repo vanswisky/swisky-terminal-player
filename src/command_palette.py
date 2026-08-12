@@ -29,6 +29,7 @@ class CommandPalette:
     STATIC_SUGGESTIONS = [
         "play", "pause", "next", "previous", "seek 01:35", "volume 80",
         "repeat one", "repeat all", "repeat off", "shuffle on", "shuffle off",
+        "radio on", "radio off",
         "theme purple", "theme blue", "theme green", "theme amber", "theme red",
         "ascii braille", "ascii block", "ascii classic", "ascii ultra",
         "reload cover", "reload lyrics", "scan library", "playlist", "queue",
