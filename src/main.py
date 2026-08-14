@@ -83,11 +83,6 @@ def main() -> None:
 
     playlist = PlaylistManager()
     scanner = LibraryScanner(music_dirs)
-    player.set_library_provider(playlist.library)
-    # Lives as a callable (not a one-off bool) so toggling "Online
-    # search" in Settings takes effect on the *next* radio top-up
-    # immediately, without Player needing to hold the whole AppConfig.
-    player.set_online_radio_enabled_provider(lambda: config.online.enabled)
 
     logger.info("Scanning music library: %s", music_dirs)
     tracks = scanner.scan_all()

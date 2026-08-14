@@ -169,4 +169,24 @@ SETTINGS_ITEMS: list[SettingItem] = [
         display=lambda c: "ON" if c.online.auto_cleanup else "OFF",
         change=lambda c, d: setattr(c.online, "auto_cleanup", not c.online.auto_cleanup),
     ),
+    SettingItem(
+        key="autoplay_enabled",
+        label="Autoplay / Radio",
+        display=lambda c: "ON" if c.autoplay.enabled else "OFF",
+        change=lambda c, d: setattr(c.autoplay, "enabled", not c.autoplay.enabled),
+    ),
+    SettingItem(
+        key="autoplay_batch_size",
+        label="Autoplay Batch Size",
+        display=lambda c: str(c.autoplay.batch_size),
+        change=lambda c, d: setattr(
+            c.autoplay, "batch_size", int(_clamp(c.autoplay.batch_size + d, 5, 50))
+        ),
+    ),
+    SettingItem(
+        key="cache_prefetch_next",
+        label="Prefetch Next Track",
+        display=lambda c: "ON" if c.cache.prefetch_next else "OFF",
+        change=lambda c, d: setattr(c.cache, "prefetch_next", not c.cache.prefetch_next),
+    ),
 ]

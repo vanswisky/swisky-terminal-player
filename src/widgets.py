@@ -222,7 +222,6 @@ def render_control_bar(
     shuffle: bool,
     muted: bool,
     column_widths: list[int],
-    radio: bool = False,
 ) -> Table:
     """8 segments matching the spec layout:
     VOL | PREV | PLAY | NEXT | REPEAT | SHUFFLE | QUEUE | EXIT
@@ -256,15 +255,13 @@ def render_control_bar(
     def cell(label: str, active: bool = False) -> Text:
         return Text(label, style=f"bold {theme.accent}" if active else theme.text_secondary, justify="center")
 
-    shuffle_label = "" + (" R" if radio else "")
-
     grid.add_row(
         cell(f"{vol_icon}{volume}%"),
         cell("󰼨"),
         cell(play_icon),
         cell("󰼧"),
         cell(repeat_label, active=repeat != RepeatMode.OFF),
-        cell(shuffle_label, active=shuffle or radio),
+        cell(f"", active=shuffle),
         cell(""),
         cell("➜]"),
     )

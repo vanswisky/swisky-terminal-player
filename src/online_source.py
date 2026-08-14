@@ -51,6 +51,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -98,8 +99,21 @@ def _yt_dlp_opts(**overrides) -> dict:
 # resolve is one blocking network round-trip; running a handful in
 # parallel (instead of one-at-a-time) is what makes "load this whole
 # playlist" take seconds instead of minutes. Kept modest so a big
-# playlist doesn't open dozens of sockets at once.
-_PLAYLIST_RESOLVE_WORKERS = 5
+# playlist doesn't open dozens of sockets at once. Bumped from the
+# original 5 -> 8: yt-dlp's per-resolve cost is dominated by network
+# round-trip latency, not local CPU, so a few more concurrent workers
+# is close to a free win for "how long does loading a playlist take"
+# without meaningfully increasing how many sockets are open at once.
+_PLAYLIST_RESOLVE_WORKERS = 8
+
+# iTunes metadata cleanup (`_enrich_playlist_with_itunes`) is a much
+# lighter request than an audio resolve — one small JSON GET, no
+# yt-dlp extraction — so it can safely run with more concurrency than
+# the audio-resolve pool above without the same "too many sockets"
+# concern, which is what actually shortens "load this playlist"'s
+# wall-clock time (the two passes are otherwise back-to-back; see
+# `resolve_playlist`'s docstring).
+_ITUNES_ENRICH_WORKERS = 12
 
 
 class OnlineSourceError(Exception):
@@ -132,7 +146,26 @@ class OnlineSearchResult:
 
 # -- iTunes (metadata search) --------------------------------------------
 
+# In-memory cache for iTunes lookups, keyed by (query, limit). The
+# same (artist, title) pair gets looked up repeatedly within a single
+# run — a track that shows up in more than one YouTube "Mix"/radio
+# playlist (see radio.py), a playlist re-imported, or the same song
+# turning up in back-to-back searches — and every one of those is
+# otherwise a fresh network round-trip for metadata that hasn't
+# changed. Session-lifetime only (never written to disk); capped so a
+# very long-running session can't grow this unboundedly.
+_itunes_cache_lock = threading.Lock()
+_itunes_cache: dict[tuple[str, int], list[dict]] = {}
+_ITUNES_CACHE_MAX_ENTRIES = 512
+
+
 def _itunes_search(query: str, limit: int) -> list[dict]:
+    cache_key = (query.strip().lower(), limit)
+    with _itunes_cache_lock:
+        cached = _itunes_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     params = urllib.parse.urlencode({
         "term": query,
         "media": "music",
@@ -145,7 +178,18 @@ def _itunes_search(query: str, limit: int) -> list[dict]:
     )
     with urllib.request.urlopen(req, timeout=10) as resp:
         payload = json.loads(resp.read().decode("utf-8"))
-    return payload.get("results") or []
+    results = payload.get("results") or []
+
+    with _itunes_cache_lock:
+        # Simple full-clear eviction rather than proper LRU bookkeeping
+        # — this cache only exists to skip *duplicate* lookups within
+        # a run, not to be a general-purpose store, so losing every
+        # entry the one time the cap is hit just means a few queries
+        # go back to a fresh network call instead of a wrong answer.
+        if len(_itunes_cache) >= _ITUNES_CACHE_MAX_ENTRIES:
+            _itunes_cache.clear()
+        _itunes_cache[cache_key] = results
+    return results
 
 
 def search(query: str, limit: int = 8) -> list[OnlineSearchResult]:
@@ -488,7 +532,7 @@ def _enrich_playlist_with_itunes(entries: list[OnlineSearchResult]) -> None:
     """
     if not entries:
         return
-    with ThreadPoolExecutor(max_workers=_PLAYLIST_RESOLVE_WORKERS) as pool:
+    with ThreadPoolExecutor(max_workers=_ITUNES_ENRICH_WORKERS) as pool:
         futures = {
             pool.submit(_itunes_best_match, entry.title, entry.artist): entry
             for entry in entries
@@ -611,3 +655,55 @@ def resolve_playlist_bulk(
     order = {entry.webpage_url: i for i, entry in enumerate(entries)}
     tracks.sort(key=lambda t: order.get(t.source_url, 0))
     return tracks
+
+
+# -- public helpers for radio.py ------------------------------------------
+#
+# radio.py needs the same yt-dlp plumbing this module already has
+# (fast-client options, the yt-dlp import guard, title parsing,
+# thumbnail fallback, iTunes enrichment) to build a "songs similar to
+# X" queue — thin wrappers around the private helpers above rather
+# than duplicating any of it, so there's exactly one place that knows
+# how to talk to yt-dlp/iTunes.
+
+def get_yt_dlp():
+    """Public alias for `_get_yt_dlp()` — see its docstring."""
+    return _get_yt_dlp()
+
+
+def yt_dlp_opts(**overrides) -> dict:
+    """Public alias for `_yt_dlp_opts()` — see its docstring."""
+    return _yt_dlp_opts(**overrides)
+
+
+def split_artist_title(raw_title: str, fallback_artist: str) -> tuple[str, str]:
+    """Public alias for `_split_artist_title()` — see its docstring."""
+    return _split_artist_title(raw_title, fallback_artist)
+
+
+def thumbnail_url(entry: dict, video_id: str) -> str | None:
+    """Public alias for `_thumbnail_url()` — see its docstring."""
+    return _thumbnail_url(entry, video_id)
+
+
+def enrich_with_itunes(entries: list[OnlineSearchResult]) -> None:
+    """Public alias for `_enrich_playlist_with_itunes()` — see its docstring."""
+    _enrich_playlist_with_itunes(entries)
+
+
+def find_video_id(query: str) -> str | None:
+    """Cheapest possible YouTube lookup: just the video id of the top
+    result for `query`, nothing else resolved (no format/stream
+    lookup). Used by radio.py to find a seed video for a text
+    (artist/album) radio request, or for a local-library seed track
+    that has no YouTube id of its own to start from. Flat search —
+    same cost/shape as `_youtube_fallback_search`. Returns None
+    (never raises) if nothing is found or the search itself fails;
+    a missing seed is the caller's problem to report, not this
+    function's to raise about.
+    """
+    try:
+        results = _youtube_fallback_search(query, limit=1)
+    except OnlineSourceError:
+        return None
+    return results[0].id if results else None

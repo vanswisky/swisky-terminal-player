@@ -206,6 +206,8 @@ scan library
 queue
 playlist
 online lofi
+radio
+radio artist Tame Impala
 ```
 
 ---
@@ -222,6 +224,64 @@ There are:
 - No static visualizer animations
 
 The UI is designed around actual player state and real interactions.
+
+---
+
+### 🔁 Autoplay & Radio
+
+Never really ends. Two related features, both built on the same idea —
+finding tracks similar to a seed via YouTube's own auto-generated
+"Mix" playlist (`list=RD<video id>`), the same "Radio" button YouTube's
+own UI offers next to any video:
+
+- **Autoplay** — when the queue naturally runs out (no repeat, nothing
+  left), a batch of similar tracks is fetched automatically and
+  playback keeps going instead of stopping dead. The fetch starts
+  proactively as soon as the *last* queued track begins playing, not
+  once it ends, so by the time playback actually gets there the batch
+  is (usually) already sitting ready — no audible gap for the network
+  round-trip. Toggle in Settings ("Autoplay / Radio") or via
+  `online.enabled`/`autoplay.enabled` in config.
+- **Radio** — start a fresh "more like this" queue on demand:
+
+  ```text
+  radio                    — from whatever's currently playing
+  radio artist NAME        — from an artist
+  radio album NAME         — from an album
+  radio SOME TEXT          — from a free-text seed
+  ```
+
+  or press `R` (currently-playing track in the main view, the
+  selected track in the Queue screen, or the selected result's artist
+  in Search). A radio queue replaces the current queue outright; once
+  *it* runs out, ordinary Autoplay keeps it going the same way it
+  would for any finished playlist.
+
+Both avoid immediately repeating a track already added this session.
+
+---
+
+### 📶 Smoother Streaming (Buffering & Prefetch)
+
+Two layers work together so a brief connection slowdown is never
+heard as a stall:
+
+- **Next-track prefetch** — while the current (online) track plays,
+  its stream is being decoded, `stream_cache.py` downloads the *next*
+  queued track's full audio stream into a local cache file in the
+  background. If it's ready by the time playback advances, that local
+  copy is used instead of the original URL — no fresh connection
+  needed right at the moment a gap would be most noticeable. Toggle in
+  Settings ("Prefetch Next Track").
+- **A larger mpv cache** — `audio_engine.py` configures a bigger
+  demuxer cache and read-ahead window (with `cache-pause=no`) so a
+  brief slowdown *mid*-track gets absorbed rather than audibly
+  stalling playback.
+
+Local library tracks never touch the network either way, so both of
+these are a no-op cost for them. Prefetched files follow the exact
+same auto-clean-on-exit rule as online covers/lyrics — see "Online
+Search" below.
 
 ---
 
@@ -325,6 +385,7 @@ or next to the audio file.
 | `A` | Cycle ASCII Mode |
 | `C` | Reload Album Cover |
 | `V` | Toggle Visualizer |
+| `R` | Radio — more tracks like what's playing |
 | `Ctrl + P` | Command Palette |
 | `Esc` | Settings |
 | `Q` | Quit |
@@ -347,6 +408,7 @@ Terminal mouse reporting is enabled automatically when supported.
 | `Enter` | Play selected track |
 | `N` / `P` | Move selected track |
 | `D` / `Backspace` | Remove selected track |
+| `R` | Radio — more tracks like the selected one |
 | `Esc` | Close |
 
 ---
@@ -397,6 +459,7 @@ Each track attempts to obtain clean title, artist, album, and cover metadata fro
 | `Enter` | Search / Play selected result |
 | `↑` / `↓` | Select result |
 | `A` | Add result to queue |
+| `R` | Radio from selected result's artist (track mode only) |
 | Typing again | Start a new query |
 | `Esc` | Close |
 
@@ -448,6 +511,12 @@ src/
 │
 ├── online_source.py
 │   └── iTunes metadata + YouTube resolution
+│
+├── radio.py
+│   └── "More like this" via YouTube Mix — powers Radio + Autoplay
+│
+├── stream_cache.py
+│   └── Background next-track prefetch to local disk cache
 │
 ├── ascii_renderer.py
 │   └── ASCII / Block / Braille rendering engine
