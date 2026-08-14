@@ -79,7 +79,29 @@ class AudioEngine:
             terminal=False,       # mpv otherwise grabs stdin itself for its own
             input_terminal=False,  # keybindings, racing keyboard_handler.py for
             config=False,           # the same bytes — this is what silently ate
-        )                            # some of the app's keypresses.
+                                      # some of the app's keypresses.
+            # -- network buffering ------------------------------------
+            # Online tracks stream over HTTP; without a generous cache
+            # a brief slowdown in that connection starves mpv's
+            # (small, by default) demuxer buffer and audibly stalls
+            # playback. A bigger cache plus a longer read-ahead window
+            # absorbs several seconds of a slow/flaky connection
+            # before that's ever heard — belt-and-braces alongside
+            # `stream_cache.py`'s next-track local prefetch, which
+            # handles the *start* of a track; this handles a hiccup
+            # mid-track, for every track (local files simply never
+            # touch the network, so this is a no-op cost for them).
+            cache=True,
+            demuxer_max_bytes="64MiB",
+            demuxer_max_back_bytes="16MiB",
+            demuxer_readahead_secs=60,
+            # Keep playing from whatever's already buffered instead of
+            # freezing playback outright the instant the network can't
+            # keep up for a moment — a short stall in incoming data is
+            # far less noticeable than mpv pausing to wait for more.
+            cache_pause=False,
+            network_timeout=15,
+        )
         self._mpv.volume = initial_volume
 
         @self._mpv.property_observer("time-pos")

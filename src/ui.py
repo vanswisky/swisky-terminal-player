@@ -62,6 +62,7 @@ from rich.panel import Panel
 from rich.text import Text
 
 import online_source
+import radio
 import widgets
 from ascii_cache import AsciiCache
 from command_palette import CommandPalette
@@ -74,6 +75,7 @@ from player import Player
 from scanner import LibraryScanner
 from settings_items import SETTINGS_ITEMS
 from settings_manager import SettingsManager
+from stream_cache import StreamPrefetcher
 from theme_manager import ThemeManager
 from utils import safe_filename
 from visualizer import SpectrumAnalyzer
@@ -219,6 +221,53 @@ class App:
         # long the whole import takes.
         self._playlist_progress: tuple[int, int] | None = None
         self._pending_playlist_load = None
+        # Result of a manually-started "radio TRACK/ARTIST/ALBUM" fetch
+        # (see `_start_radio`) — same generation-gated hand-off as
+        # search/resolve/playlist above, just one more `_pending_*`
+        # slot drained by `_poll_online_search`.
+        self._pending_radio = None
+
+        # -- Autoplay (continuous "radio" once the queue runs out) ---
+        # Separate lock from `_search_lock` above: Autoplay's fetch is
+        # triggered by playback events (a track starting/ending), not
+        # by anything happening on the Search screen, and can be
+        # in flight regardless of what screen is open — keeping it on
+        # its own lock means an unrelated online search can't race
+        # with or block it. See `_on_track_changed` (where a fetch is
+        # proactively *started*, as soon as the last queued track
+        # begins — this is what avoids an audible gap) and
+        # `_on_queue_end`/`_poll_autoplay` (where the result is
+        # *applied*, once the queue has actually run out).
+        self._autoplay_lock = threading.Lock()
+        self._autoplay_in_flight = False
+        self._autoplay_seed_path: str | None = None
+        self._autoplay_ready: list | None = None
+        self._autoplay_awaiting_apply = False
+        self._autoplay_awaiting_track = None
+        # YouTube video ids already added by Autoplay/radio this
+        # session, passed as `exclude_ids` to `radio.similar_tracks` so
+        # a long-running Autoplay session doesn't loop back over the
+        # same handful of tracks every time it re-queries the same (or
+        # a similar) seed's mix. Simple full-clear eviction once it
+        # gets too big — same "not a general-purpose store" trade-off
+        # as `online_source.py`'s iTunes cache — rather than proper
+        # LRU bookkeeping for what's just a "don't immediately repeat"
+        # nicety, not a correctness requirement.
+        self._autoplay_seen_ids: set[str] = set()
+
+        # Downloads the next queued track's stream ahead of time (see
+        # stream_cache.py) — checked once per track load via
+        # `Player.set_path_resolver` below, and kept warm from
+        # `_on_track_changed` every time "what's next" changes.
+        self._prefetcher = StreamPrefetcher()
+
+        # Small transient message shown in the header when it isn't
+        # busy being the search bar — used for Autoplay/Radio status
+        # ("finding songs like X…") so there's visible feedback for
+        # background activity the user didn't have to open a screen
+        # to trigger. See `_show_toast`/`_current_toast`.
+        self._toast: str = ""
+        self._toast_expires: float = 0.0
 
         # Hit regions for mouse support, recomputed each frame.
         self._progress_row: int | None = None
@@ -240,6 +289,8 @@ class App:
         self._register_commands()
 
         self.player.on_track_changed(self._on_track_changed)
+        self.player.on_queue_end(self._on_queue_end)
+        self.player.set_path_resolver(self._prefetcher.local_path_for)
         # main.py loads the initial queue before this App (and this
         # listener) exists, so the very first "track changed" event fires
         # into an empty listener list — the spectrum analyzer never gets
@@ -290,6 +341,18 @@ class App:
                     lambda m: self._open_search(prefill=m.group(1), mode="playlist"))
         cp.register(r"^online (.+)$", "online QUERY — search for a track and open results",
                     lambda m: self._open_search(prefill=m.group(1)))
+        # Registered before the generic "radio QUERY" pattern below for
+        # the same reason as "online playlist" above — "radio artist
+        # X"/"radio album X" would otherwise be swallowed by "radio
+        # (.+)"'s own ".+".
+        cp.register(r"^radio$", "radio — play more tracks like the current one",
+                    lambda m: self._start_radio(seed_track=self.player.current_track()))
+        cp.register(r"^radio artist (.+)$", "radio artist NAME — radio from an artist",
+                    lambda m: self._start_radio(artist=m.group(1)))
+        cp.register(r"^radio album (.+)$", "radio album NAME — radio from an album",
+                    lambda m: self._start_radio(album=m.group(1)))
+        cp.register(r"^radio (.+)$", "radio QUERY — radio from a track/artist/album name",
+                    lambda m: self._start_radio(query=m.group(1)))
         cp.register(r"^exit$", "exit — quit the app", lambda m: self._quit())
 
     # -- lifecycle ---------------------------------------------------------
@@ -298,6 +361,21 @@ class App:
         if track is not None:
             self.spectrum.load_async(track.path, http_headers=track.stream_headers)
             self._last_cover = None  # force ASCII re-render on next frame
+
+            next_track = self.player.queue.peek_next(
+                self.config.playback.repeat, self.config.playback.shuffle
+            )
+            if self.config.cache.prefetch_next:
+                self._prefetcher.prefetch(next_track)
+
+            # `track` is the last thing queued (nothing comes after it
+            # under the current repeat/shuffle rules) — start fetching
+            # an Autoplay batch *now*, while it's still playing, so the
+            # batch is (usually) already sitting in `_autoplay_ready`
+            # by the time `_on_queue_end` actually needs it. See the
+            # class docstring note on `_autoplay_lock`.
+            if next_track is None and self.config.autoplay.enabled and self.config.online.enabled:
+                self._start_autoplay_fetch(track)
 
     def _set_theme(self, name: str) -> None:
         if self.theme_mgr.set_theme(name):
@@ -361,7 +439,175 @@ class App:
             self.queue_scroll = self.queue_cursor - rows + 1
         self.queue_scroll = max(0, self.queue_scroll)
 
+    # -- toast (small transient header message) ---------------------------
+
+    def _show_toast(self, message: str, seconds: float = 5.0) -> None:
+        self._toast = message
+        self._toast_expires = time.monotonic() + seconds
+
+    def _current_toast(self) -> str | None:
+        if self._toast and time.monotonic() < self._toast_expires:
+            return self._toast
+        return None
+
+    # -- autoplay (continuous radio once the queue runs out) --------------
+    #
+    # See the `_autoplay_lock` block in `__init__` for the two-phase
+    # design: `_start_autoplay_fetch` is called *proactively*, from
+    # `_on_track_changed`, the moment the last queued track begins —
+    # not only once it ends — specifically so the network round-trip
+    # a radio fetch needs usually finishes before it's actually needed.
+    # `_on_queue_end`/`_poll_autoplay` is where the result actually
+    # gets spliced into the queue and playback resumed.
+
+    def _start_autoplay_fetch(self, seed_track) -> None:
+        with self._autoplay_lock:
+            if self._autoplay_in_flight or self._autoplay_seed_path == seed_track.path:
+                # Already fetching (or already fetched) a batch for
+                # this exact seed — nothing new to do. This is also
+                # what makes it safe for both `_on_track_changed`'s
+                # proactive call *and* `_on_queue_end`'s fallback call
+                # to target the same seed without double-fetching.
+                return
+            self._autoplay_in_flight = True
+            self._autoplay_seed_path = seed_track.path
+            self._autoplay_ready = None
+        threading.Thread(target=self._autoplay_worker, args=(seed_track,), daemon=True).start()
+
+    _AUTOPLAY_SEEN_CAP = 300
+
+    def _remember_autoplay_ids(self, candidate_ids: list[str]) -> None:
+        with self._autoplay_lock:
+            if len(self._autoplay_seen_ids) >= self._AUTOPLAY_SEEN_CAP:
+                self._autoplay_seen_ids.clear()
+            self._autoplay_seen_ids.update(candidate_ids)
+
+    def _autoplay_worker(self, seed_track) -> None:
+        with self._autoplay_lock:
+            exclude = set(self._autoplay_seen_ids)
+        try:
+            candidates = radio.similar_tracks(
+                seed_track=seed_track, limit=self.config.autoplay.batch_size,
+                exclude_ids=exclude,
+            )
+            self._remember_autoplay_ids([c.id for c in candidates])
+            tracks = online_source.resolve_playlist_bulk(candidates)
+        except (radio.RadioError, online_source.OnlineSourceError) as exc:
+            logger.debug("Autoplay fetch found nothing for %r: %s", seed_track.title, exc)
+            tracks = []
+        except Exception:  # noqa: BLE001 — Autoplay is best-effort; it must never crash the app
+            logger.exception("Autoplay fetch failed for %r", seed_track.title)
+            tracks = []
+        with self._autoplay_lock:
+            self._autoplay_ready = tracks
+            self._autoplay_in_flight = False
+
+    def _on_queue_end(self, finished_track) -> None:
+        """Fired by `player.py` when the queue runs out naturally (no
+        repeat, nothing left). If Autoplay is off, this is a no-op —
+        playback just stays stopped, same as before Autoplay existed.
+        """
+        if finished_track is None or not self.config.autoplay.enabled or not self.config.online.enabled:
+            return
+        with self._autoplay_lock:
+            self._autoplay_awaiting_apply = True
+            self._autoplay_awaiting_track = finished_track
+        # Fallback for whenever nothing was pre-fetched for this exact
+        # track (Autoplay just got turned on, the queue ended some way
+        # other than "last track finished naturally", etc.) — a no-op
+        # if `_on_track_changed` already started this same fetch.
+        self._start_autoplay_fetch(finished_track)
+        self._show_toast(f"Autoplay: finding songs like '{finished_track.title}'…")
+
+    def _poll_autoplay(self) -> None:
+        """Called once per frame from `run()`, same pattern as
+        `_poll_online_search`. Applies a ready Autoplay batch — adds
+        its tracks to the queue and resumes playback — the instant
+        both "the queue just ended" and "the batch finished fetching"
+        are true; if the batch isn't ready yet, just waits for a later
+        frame.
+        """
+        with self._autoplay_lock:
+            if not self._autoplay_awaiting_apply or self._autoplay_ready is None:
+                return
+            ready = self._autoplay_ready
+            seed = self._autoplay_awaiting_track
+            # The batch that just finished fetching might belong to a
+            # different seed than what's actually pending application
+            # (e.g. the queue got edited in between) — comparing the
+            # seed path this batch was fetched for against the one
+            # `_on_queue_end` is waiting on catches that; safer to
+            # show nothing than splice in tracks for the wrong song.
+            stale = seed is None or self._autoplay_seed_path != seed.path
+            self._autoplay_ready = None
+            self._autoplay_awaiting_apply = False
+            self._autoplay_awaiting_track = None
+
+        if stale:
+            return
+        if ready:
+            for track in ready:
+                self.player.queue.add_end(track)
+            self.player.next()  # queue was stuck at its old last index — this resumes into the new tracks
+            self._show_toast(f"Autoplay: continuing with songs like '{seed.title}'.")
+        else:
+            self._show_toast("Autoplay: couldn't find similar tracks.")
+
+    # -- radio (user-initiated "play more like this") ----------------------
+
+    def _start_radio(
+        self, seed_track=None, artist: str | None = None,
+        album: str | None = None, query: str | None = None,
+    ) -> None:
+        """Starts a fresh radio queue from a specific track, an
+        artist, an album, or a raw query — see `radio.py`. Replaces
+        the current queue outright (like loading a playlist) rather
+        than inserting after the current track; once *this* radio
+        queue runs out, ordinary Autoplay (if enabled) keeps it going
+        the same way it would for any other finished queue.
+        """
+        if not self.config.online.enabled:
+            self._show_toast("Online search is off — enable it in Settings.")
+            return
+        label = (
+            seed_track.title if seed_track is not None
+            else (query or artist or album or "")
+        )
+        if not label and seed_track is None:
+            self._show_toast("Nothing to start a radio from.")
+            return
+        self._show_toast(f"Radio: finding songs like '{label}'…")
+        generation = self._bump_search_generation()
+        threading.Thread(
+            target=self._radio_worker,
+            args=(seed_track, artist, album, query, generation),
+            daemon=True,
+        ).start()
+
+    def _radio_worker(self, seed_track, artist, album, query, generation: int) -> None:
+        try:
+            with self._autoplay_lock:
+                exclude = set(self._autoplay_seen_ids)
+            results = radio.similar_tracks(
+                seed_track=seed_track, artist=artist, album=album, query=query,
+                limit=self.config.autoplay.batch_size, exclude_ids=exclude,
+            )
+            self._remember_autoplay_ids([r.id for r in results])
+            tracks = online_source.resolve_playlist_bulk(results)
+            if not tracks:
+                raise radio.RadioError("Could not resolve any playable tracks for this radio.")
+            payload = ("ok", tracks)
+        except radio.RadioError as exc:
+            payload = ("error", str(exc))
+        except Exception as exc:  # noqa: BLE001 — a background worker must never crash the app; report and move on
+            logger.exception("Radio fetch failed")
+            payload = ("error", f"Radio failed: {exc}")
+        with self._search_lock:
+            if generation == self._search_generation:
+                self._pending_radio = payload
+
     # -- online (iTunes search, YouTube audio) search --------------------
+
     #
     # Two network-bound steps (see online_source.py's module docstring
     # for why they're split): a cheap `search()` against iTunes to list
@@ -483,6 +729,7 @@ class App:
             self._pending_resolve = None
             self._pending_playlist_load = None
             self._playlist_progress = None
+            self._pending_radio = None
             return self._search_generation
 
     def _cancel_search(self) -> None:
@@ -503,6 +750,8 @@ class App:
             pending_playlist = self._pending_playlist_load
             self._pending_playlist_load = None
             playlist_progress = self._playlist_progress
+            pending_radio = self._pending_radio
+            self._pending_radio = None
 
         if pending_search is not None:
             kind, payload = pending_search
@@ -557,6 +806,16 @@ class App:
             done, total = playlist_progress
             self.search_status = f"Loading playlist… ({done}/{total} tracks resolved)"
 
+        if pending_radio is not None:
+            kind, payload = pending_radio
+            if kind == "ok":
+                tracks = payload
+                self.player.load_queue(tracks)
+                self.mode = ScreenMode.NORMAL  # jump to now-playing
+                self._show_toast(f"Radio: playing {len(tracks)} similar track(s).")
+            else:
+                self._show_toast(payload)
+
     def _quit(self) -> None:
         self.running = False
 
@@ -574,6 +833,7 @@ class App:
                     start = time.monotonic()
                     self.player.poll()  # advance queue on natural track end
                     self._poll_online_search()  # drain background search/resolve results
+                    self._poll_autoplay()  # apply a ready Autoplay batch once the queue ends
                     self._handle_input()
                     layout = self._build_layout()
                     live.update(layout, refresh=True)
@@ -644,6 +904,12 @@ class App:
             self._open_search()
         elif key == "P":
             self._open_playlists()
+        elif key == "R":
+            current = self.player.current_track()
+            if current is not None:
+                self._start_radio(seed_track=current)
+            else:
+                self._show_toast("Nothing is playing to start a radio from.")
         elif key == "f":
             pass  # fullscreen is inherent to `Live(screen=True)`
         elif key == "CTRL_P":
@@ -695,6 +961,8 @@ class App:
             self.player.queue.remove(self.queue_cursor)
             self.queue_cursor = min(self.queue_cursor, max(0, len(self.player.queue.items) - 1))
             self._sync_queue_scroll()
+        elif key == "R" and items:
+            self._start_radio(seed_track=items[self.queue_cursor])
 
     def _handle_playlists_key(self, key: str) -> None:
         """UP/DOWN select, Enter loads the playlist and replaces the
@@ -764,6 +1032,13 @@ class App:
                 self._resolve_and_load_playlist(selected, mode="enqueue")
             else:
                 self._resolve_and_enqueue_online(selected)
+        elif key == "R" and self.search_results and self.search_mode == "track":
+            # Radio from the selected result's artist — text-based
+            # rather than resolving the result to a full track first
+            # (an OnlineSearchResult isn't a TrackMetadata; nothing
+            # here needs its audio stream, just its artist name).
+            selected = self.search_results[self.search_cursor]
+            self._start_radio(artist=selected.artist)
         elif key == "BACKSPACE":
             if self.search_results:
                 self.search_results = []
@@ -1213,9 +1488,17 @@ class App:
             icons,
             ("✨ ", theme.text_muted),
             ("Search for a track or artist…", theme.text_muted),
-            ("  ('o' search · 'P' playlists)", theme.text_muted),
+            ("  ('o' search · 'P' playlists · 'R' radio)", theme.text_muted),
         )
         self._header_search_cols = (search_start, max(search_start, self.console.size.width - 3))
+        toast = self._current_toast()
+        if toast:
+            text = Text.assemble(
+                icons,
+                ("📻 ", theme.accent),
+                (toast, f"bold {theme.text_secondary}"),
+            )
+            return Panel(text, border_style=theme.accent)
         return Panel(text, border_style=theme.border)
 
     def _render_search_results_panel(self, theme):
@@ -1236,7 +1519,7 @@ class App:
             if self.search_mode == "playlist":
                 subtitle = "↑/↓ select · Enter load & play · a add all to queue · TAB tracks · Esc close"
             else:
-                subtitle = "↑/↓ select · Enter play next · a add to queue · TAB playlists · Esc close"
+                subtitle = "↑/↓ select · Enter play next · a add to queue · R radio · TAB playlists · Esc close"
         elif self.search_status:
             # Covers several states with one line: "Searching '...'",
             # "Loading '...'", "Added '...' to queue", error text, or
@@ -1275,7 +1558,7 @@ class App:
                 self.player.queue.items, self.queue_cursor, self.player.queue.cursor, theme,
                 max_rows=self.queue_visible_rows, scroll_offset=self.queue_scroll,
             )
-            return Panel(body, title="QUEUE", subtitle="↑/↓ move · Enter play · d remove · Esc close",
+            return Panel(body, title="QUEUE", subtitle="↑/↓ move · Enter play · d remove · R radio · Esc close",
                          border_style=theme.accent)
 
         if self.mode == ScreenMode.PLAYLISTS:

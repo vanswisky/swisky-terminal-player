@@ -30,6 +30,8 @@ from queue_manager import QueueManager
 logger = logging.getLogger(__name__)
 
 TrackChangedCallback = Callable[[Optional[TrackMetadata]], None]
+QueueEndCallback = Callable[[Optional[TrackMetadata]], None]
+PathResolver = Callable[[TrackMetadata], Optional[str]]
 
 
 class Player:
@@ -41,6 +43,23 @@ class Player:
 
         self._lock = threading.RLock()
         self._on_track_changed: list[TrackChangedCallback] = []
+        # Fired from `next()` when the queue runs out naturally (no
+        # repeat, nothing left to advance to) — distinct from
+        # `on_track_changed(None)` (also fired at that moment) because
+        # listeners that only care about "should I keep this playing
+        # some other way" (see `ui.py`'s Autoplay) need the track that
+        # *just finished* as their seed, not a bare "nothing's playing"
+        # signal.
+        self._on_queue_end: list[QueueEndCallback] = []
+        # Optional hook (set via `set_path_resolver`) letting a caller
+        # substitute a local path for whatever `track.path` would
+        # otherwise be loaded — used by `ui.py` to hand mpv a fully
+        # prefetched local copy of an online track's stream when one's
+        # ready (see stream_cache.py), instead of the original remote
+        # URL. Kept as an injected function rather than an import here
+        # so this module stays network/caching-agnostic, matching its
+        # "playback transport logic" scope (see module docstring).
+        self._path_resolver: Optional[PathResolver] = None
         self.muted = False
         self._pre_mute_volume = config.volume
 
@@ -49,6 +68,12 @@ class Player:
     def on_track_changed(self, callback: TrackChangedCallback) -> None:
         self._on_track_changed.append(callback)
 
+    def on_queue_end(self, callback: QueueEndCallback) -> None:
+        self._on_queue_end.append(callback)
+
+    def set_path_resolver(self, resolver: Optional[PathResolver]) -> None:
+        self._path_resolver = resolver
+
     def _notify_track_changed(self) -> None:
         track = self.queue.current()
         for cb in list(self._on_track_changed):
@@ -56,6 +81,34 @@ class Player:
                 cb(track)
             except Exception:  # noqa: BLE001
                 logger.exception("track_changed callback raised")
+
+    def _notify_stopped(self) -> None:
+        """Same as `_notify_track_changed()`, but explicitly with
+        `None` rather than whatever `queue.current()` happens to
+        return. The two aren't always the same thing: when `next()`
+        runs out of queue (no repeat, nothing left), `advance()`
+        deliberately leaves `cursor` pointing at the last track it
+        *was* on — see `queue_manager.QueueManager.advance` — so
+        `queue.current()` still returns that same, now-stopped track
+        rather than `None`. Calling `_notify_track_changed()` there
+        would tell every listener "a new track just started" (the
+        exact same one that just finished), causing pointless re-work
+        like the visualizer re-decoding a track that isn't playing
+        anymore. This method is what `next()` actually calls in that
+        case so listeners correctly hear "nothing is playing" instead.
+        """
+        for cb in list(self._on_track_changed):
+            try:
+                cb(None)
+            except Exception:  # noqa: BLE001
+                logger.exception("track_changed callback raised")
+
+    def _notify_queue_end(self, finished_track: Optional[TrackMetadata]) -> None:
+        for cb in list(self._on_queue_end):
+            try:
+                cb(finished_track)
+            except Exception:  # noqa: BLE001
+                logger.exception("queue_end callback raised")
 
     # -- queue / loading ----------------------------------------------------
 
@@ -89,8 +142,29 @@ class Player:
         `stream_headers` (needed by some CDNs to avoid a 403) get
         forwarded to mpv the same way regardless of which of those
         three called us.
+
+        If a path resolver is set (see `set_path_resolver`) and it
+        returns something for this track — a fully prefetched local
+        copy of an online track's stream — mpv loads that local path
+        instead of `track.path`. HTTP headers are only meaningful for
+        the *remote* URL, so they're skipped for a local substitute;
+        `track.path` itself is left untouched either way, so every
+        other consumer of the track object (lyrics lookup, the
+        visualizer, "now playing" display) keeps seeing the real
+        source path/URL.
         """
-        self.engine.load(track.path, http_headers=track.stream_headers)
+        load_path = track.path
+        if self._path_resolver is not None:
+            try:
+                resolved = self._path_resolver(track)
+            except Exception:  # noqa: BLE001 — a broken resolver must never block playback
+                logger.exception("path_resolver raised")
+                resolved = None
+            if resolved:
+                load_path = resolved
+
+        headers = track.stream_headers if load_path == track.path else None
+        self.engine.load(load_path, http_headers=headers)
         self.engine.set_speed(self.config.speed)
         self.lyrics.load_for_track(track)
         self._notify_track_changed()
@@ -119,10 +193,17 @@ class Player:
 
     def next(self) -> None:
         with self._lock:
+            finished = self.queue.current()
             track = self.queue.advance(self.config.repeat, self.config.shuffle)
             if track is None:
                 self.engine.stop()
-                self._notify_track_changed()
+                self._notify_stopped()
+                # Only a genuine "ran out of queue" — not e.g. an
+                # empty queue to begin with, since `advance()` already
+                # returns None immediately for that case too, and
+                # `finished` would be None there (nothing was playing
+                # to seed an Autoplay/radio continuation from anyway).
+                self._notify_queue_end(finished)
                 return
             self._load_track(track)
 

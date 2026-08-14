@@ -33,6 +33,7 @@ class CommandPalette:
         "ascii braille", "ascii block", "ascii classic", "ascii ultra",
         "reload cover", "reload lyrics", "scan library", "playlist", "queue",
         "online playlist", "mute", "speed 1.25", "fullscreen", "exit",
+        "radio", "radio artist", "radio album",
     ]
 
     def __init__(self) -> None:

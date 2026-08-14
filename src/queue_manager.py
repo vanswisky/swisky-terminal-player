@@ -98,6 +98,38 @@ class QueueManager:
 
         return None  # end of queue
 
+    def peek_next(self, repeat: RepeatMode, shuffle: bool) -> TrackMetadata | None:
+        """Read-only lookahead: whatever `advance()` would move to
+        right now, under the same repeat/shuffle rules, *without*
+        touching `cursor` or the shuffle order. Used by callers that
+        want to warm something up ahead of time for whatever's coming
+        up next — `stream_cache.StreamPrefetcher`'s next-track
+        download, and `ui.py`'s Autoplay pre-fetch (which needs to
+        know when the *current* track is the last one queued) — while
+        leaving actual playback navigation untouched.
+        """
+        if not self.items:
+            return None
+        if repeat == RepeatMode.ONE:
+            return self.current()
+        if shuffle:
+            if not self._shuffle_order:
+                return None
+            try:
+                pos = self._shuffle_order.index(self.cursor)
+            except ValueError:
+                pos = -1
+            if pos + 1 < len(self._shuffle_order):
+                return self.items[self._shuffle_order[pos + 1]]
+            if repeat == RepeatMode.ALL:
+                return self.items[self._shuffle_order[0]]
+            return None
+        if self.cursor + 1 < len(self.items):
+            return self.items[self.cursor + 1]
+        if repeat == RepeatMode.ALL:
+            return self.items[0]
+        return None
+
     def previous(self, shuffle: bool) -> TrackMetadata | None:
         if not self.items:
             return None

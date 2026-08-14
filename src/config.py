@@ -101,7 +101,35 @@ class OnlineConfig:
     # Delete covers/lyrics/ASCII renders created by online mode this
     # run, on exit — keeps assets/{covers,lyrics,cache} from silently
     # growing forever from tracks that were only ever played once.
+    # `stream_cache.py`'s next-track prefetch files are covered by the
+    # exact same on-exit sweep (see session_cleanup.py) — this one
+    # flag governs all of it, not a separate knob per feature.
     auto_cleanup: bool = True
+
+
+@dataclass(slots=True)
+class AutoplayConfig:
+    # When the queue runs out (no repeat, nothing left), automatically
+    # fetch and queue tracks similar to whatever just finished instead
+    # of stopping dead — see radio.py / Player.on_queue_end. Also what
+    # keeps a manually-started "radio ARTIST/ALBUM/track" going once
+    # its initial batch runs out.
+    enabled: bool = True
+    # How many similar tracks to fetch per batch — both when Autoplay
+    # kicks in and as the initial size of a manually-started radio.
+    batch_size: int = 15
+
+
+@dataclass(slots=True)
+class CacheConfig:
+    # Prefetch the next queued track's audio stream into a local disk
+    # cache while the current one is still playing, so advancing to it
+    # doesn't need a fresh network connection — smooths over a brief
+    # connection slowdown right at the moment a gap would be most
+    # noticeable. Only ever applies to online (YouTube-streamed)
+    # tracks; local library files are already instant. See
+    # stream_cache.py.
+    prefetch_next: bool = True
 
 
 @dataclass(slots=True)
@@ -112,6 +140,8 @@ class AppConfig:
     playback: PlaybackConfig = field(default_factory=PlaybackConfig)
     lyrics: LyricsConfig = field(default_factory=LyricsConfig)
     online: OnlineConfig = field(default_factory=OnlineConfig)
+    autoplay: AutoplayConfig = field(default_factory=AutoplayConfig)
+    cache: CacheConfig = field(default_factory=CacheConfig)
     ui_fps: int = 30
     mouse_enabled: bool = True
     library_paths: list[str] = field(default_factory=list)
@@ -174,5 +204,16 @@ class AppConfig:
             search_results=o.get("search_results", cfg.online.search_results),
             playlist_track_limit=o.get("playlist_track_limit", cfg.online.playlist_track_limit),
             auto_cleanup=o.get("auto_cleanup", cfg.online.auto_cleanup),
+        )
+
+        ap = d.get("autoplay", {})
+        cfg.autoplay = AutoplayConfig(
+            enabled=ap.get("enabled", cfg.autoplay.enabled),
+            batch_size=ap.get("batch_size", cfg.autoplay.batch_size),
+        )
+
+        ca = d.get("cache", {})
+        cfg.cache = CacheConfig(
+            prefetch_next=ca.get("prefetch_next", cfg.cache.prefetch_next),
         )
         return cfg
